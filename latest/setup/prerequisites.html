@@ -165,9 +165,25 @@
                         <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <p>This project requires:</p>
 <ul>
+<li><strong>Git LFS</strong> (this repo uses Git Large File Storage for chain state files)</li>
 <li>The <strong>Foundry nightly toolchain</strong></li>
 <li>The <strong>Rust toolchain</strong></li>
 </ul>
+<h3 id="install-git-lfs"><a class="header" href="#install-git-lfs">Install Git LFS</a></h3>
+<p>This repository uses <a href="https://git-lfs.com">Git LFS</a> to store large chain state files (<code>*.json.gz</code>, <code>*.tar.gz</code>).
+You <strong>must</strong> install and initialize Git LFS before cloning, otherwise you’ll get small pointer files instead of the actual data.</p>
+<pre><code class="language-bash"># macOS
+brew install git-lfs
+
+# Ubuntu/Debian
+sudo apt-get install -y git-lfs
+</code></pre>
+<p>Then run the one-time global setup:</p>
+<pre><code class="language-bash">git lfs install
+</code></pre>
+<p>After this, <code>git clone</code> will automatically fetch LFS files. If you already cloned without LFS, run:</p>
+<pre><code class="language-bash">git lfs pull
+</code></pre>
 <h3 id="install-foundry-v151"><a class="header" href="#install-foundry-v151">Install Foundry (v1.5.1)</a></h3>
 <p>Install <a href="https://getfoundry.sh/">Foundry</a> v1.5.1:</p>
 <pre><code class="language-bash"># Download the Foundry installer
