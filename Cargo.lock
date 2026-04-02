@@ -13929,6 +13929,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "zksync-os-revm"
+version = "0.1.0"
+source = "git+https://github.com/vladbochok/zksync-os-revm?branch=vb%2Fsecond-proof-system#9391f9e216047e61cd10c253ab7f59c1148e3b91"
+dependencies = [
+ "auto_impl",
+ "revm",
+ "serde",
+]
+
+[[package]]
+name = "zksync-os-zisk-lib"
+version = "0.1.0"
+source = "git+https://github.com/vladbochok/zksync-os-zisk?branch=main#242686530fcb45b71381fbf0ac5d0e2b1c05abf5"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "bincode 1.3.3",
+ "blake2",
+ "revm",
+ "serde",
+ "tiny-keccak",
+ "zksync-os-revm 0.1.0 (git+https://github.com/vladbochok/zksync-os-revm?branch=vb%2Fsecond-proof-system)",
+]
+
+[[package]]
 name = "zksync_os_api"
 version = "0.1.0"
 source = "git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14#414c746e9c81392b8c0b75602c4a62097abdf066"
@@ -14136,6 +14162,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures",
+ "hex",
  "regex",
  "reqwest",
  "reth-tasks",
@@ -14149,6 +14176,7 @@ dependencies = [
  "test-log",
  "tokio",
  "tracing",
+ "zksync-os-zisk-lib",
  "zksync_os_api",
  "zksync_os_contract_interface",
  "zksync_os_integration_tests_macros",
@@ -14529,7 +14557,7 @@ dependencies = [
  "tracing",
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
- "zksync-os-revm",
+ "zksync-os-revm 0.1.0 (git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4)",
  "zksync_os_genesis",
  "zksync_os_interface",
  "zksync_os_internal_config",
@@ -14715,6 +14743,7 @@ dependencies = [
  "axum",
  "base64",
  "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
+ "bincode 1.3.3",
  "bincode 2.0.1",
  "blake2",
  "clap",
@@ -14732,6 +14761,7 @@ dependencies = [
  "reth-net-nat",
  "reth-network-peers",
  "reth-tasks",
+ "revm",
  "ruint",
  "rustls",
  "semver 1.0.26",
@@ -14751,6 +14781,8 @@ dependencies = [
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=dev-20260320-1)",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
+ "zksync-os-revm 0.1.0 (git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4)",
+ "zksync-os-zisk-lib",
  "zksync_os_base_token_adjuster",
  "zksync_os_batch_types",
  "zksync_os_batch_verification",
@@ -14926,6 +14958,27 @@ dependencies = [
  "tracing-subscriber 0.3.22",
  "zksync_os_merkle_tree_api",
  "zksync_os_rpc_api",
+]
+
+[[package]]
+name = "zksync_os_zisk_batch_test"
+version = "0.18.1"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "bincode 2.0.1",
+ "clap",
+ "hex",
+ "rocksdb",
+ "semver 1.0.26",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "zksync-os-zisk-lib",
+ "zksync_os_interface",
+ "zksync_os_types",
 ]
 
 [[package]]

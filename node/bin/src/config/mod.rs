@@ -877,6 +877,12 @@ pub struct ProverInputGeneratorConfig {
     /// is unnecessary.
     #[config(default_t = true)]
     pub enable_input_generation: bool,
+
+    /// When true, generate a second proof system's input alongside the
+    /// primary airbender witness. Currently this is ZiSK (RV64IMA).
+    /// The two proofs run in parallel — the primary is always airbender.
+    #[config(default_t = false)]
+    pub second_proof_system: bool,
 }
 
 /// Only used on the Main Node.

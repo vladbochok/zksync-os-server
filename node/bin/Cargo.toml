@@ -53,6 +53,10 @@ zksync_os_config_validation_macros.workspace = true
 zk_ee.workspace = true
 zk_os_forward_system.workspace = true
 
+zksync-os-zisk-lib = { git = "https://github.com/vladbochok/zksync-os-zisk", branch = "main" }
+zksync-os-revm.workspace = true
+revm = { version = "=34.0.0", default-features = false, features = ["std"] }
+
 zk_ee_dev.workspace = true
 zk_os_forward_system_dev.workspace = true
 
@@ -89,6 +93,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 semver = { workspace = true, features = ["serde"] }
 bincode.workspace = true
+bincode1 = { package = "bincode", version = "1.3" }
 smart-config = { workspace = true, features = ["primitive-types", "alloy"] }
 smart-config-commands.workspace = true
 axum.workspace = true

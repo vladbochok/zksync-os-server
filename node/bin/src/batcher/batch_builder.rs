@@ -77,7 +77,14 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     let proving_version =
         ProvingVersion::try_from(blocks.first().unwrap().1.protocol_version.clone())?;
     // execution version should be the same for all the blocks, it is ensured by the seal criteria
-    let batch_prover_input = compute_batch_prover_input(blocks, proving_version, pubdata_mode)?;
+    let batch_prover_input = compute_batch_prover_input(
+        blocks,
+        proving_version,
+        pubdata_mode,
+        multichain_root,
+        sl_chain_id,
+        &batch_info,
+    )?;
 
     // Sanity check: all blocks in the batch should have the same protocol version
     for (_, replay_record, _, _) in blocks.iter().skip(1) {
@@ -129,56 +136,152 @@ fn compute_batch_prover_input(
     )],
     proving_version: ProvingVersion,
     pubdata_mode: PubdataMode,
+    multichain_root: alloy::primitives::B256,
+    sl_chain_id: u64,
+    batch_info: &BatchInfo,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_dev::run::generate_batch_proof_input as generate_batch_proof_input_dev;
 
     if blocks
         .iter()
-        .any(|(_, _, _, pi)| matches!(pi, ProverInput::Fake))
+        .any(|(_, _, _, pi)| pi.is_fake())
     {
         return Ok(ProverInput::Fake);
     }
 
-    Ok(match proving_version {
-        ProvingVersion::V1
-        | ProvingVersion::V2
-        | ProvingVersion::V3
-        | ProvingVersion::V4
-        | ProvingVersion::V5 => {
+    // Generate airbender batch witness (primary proof system)
+    let da_scheme_u8 = pubdata_mode.da_commitment_scheme() as u8;
+    let block_witnesses: Vec<&[u32]> = blocks
+        .iter()
+        .map(|(_, _, _, pi)| pi.unwrap_real())
+        .collect();
+    let block_pubdata: Vec<&[u8]> = blocks
+        .iter()
+        .map(|(bo, _, _, _)| bo.pubdata.as_slice())
+        .collect();
+
+    let witness = match proving_version {
+        ProvingVersion::V1 | ProvingVersion::V2 | ProvingVersion::V3
+        | ProvingVersion::V4 | ProvingVersion::V5 => {
             panic!("sealing batch with prover version v1-v5 is not supported");
         }
-        ProvingVersion::V6 => {
-            // TODO: in the long-term we should generate proof input per batch
-            ProverInput::Real(generate_batch_proof_input(
-                blocks
-                    .iter()
-                    .map(|(_, _, _, prover_input)| prover_input.unwrap_real())
-                    .collect(),
-                (pubdata_mode.da_commitment_scheme() as u8)
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?,
-                blocks
-                    .iter()
-                    .map(|(block_output, _, _, _)| block_output.pubdata.as_slice())
-                    .collect(),
-            ))
+        ProvingVersion::V6 | ProvingVersion::ZiskV1 => {
+            let da = da_scheme_u8.try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?;
+            generate_batch_proof_input(block_witnesses, da, block_pubdata)
         }
         ProvingVersion::V7 => {
-            // TODO: in the long-term we should generate proof input per batch
-            ProverInput::Real(generate_batch_proof_input_dev(
-                blocks
-                    .iter()
-                    .map(|(_, _, _, prover_input)| prover_input.unwrap_real())
-                    .collect(),
-                (pubdata_mode.da_commitment_scheme() as u8)
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?,
-                blocks
-                    .iter()
-                    .map(|(block_output, _, _, _)| block_output.pubdata.as_slice())
-                    .collect(),
-            ))
+            let da = da_scheme_u8.try_into()
+                .map_err(|_| anyhow::anyhow!("Failed to convert DA commitment scheme"))?;
+            generate_batch_proof_input_dev(block_witnesses, da, block_pubdata)
         }
-    })
+    };
+
+    // If any block carries ZiSK data, assemble the batch-level ZiSK BatchInput
+    let has_zisk = blocks.iter().any(|(_, _, _, pi)| pi.zisk_data().is_some());
+    let zisk_data = if has_zisk {
+        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info)?)
+    } else {
+        None
+    };
+
+    Ok(ProverInput::Real { witness, zisk_data })
+}
+
+/// Assemble per-block ZiSK data into a single batch-level BatchInput.
+fn assemble_zisk_batch(
+    blocks: &[(
+        zksync_os_interface::types::BlockOutput,
+        zksync_os_storage_api::ReplayRecord,
+        zksync_os_merkle_tree::TreeBatchOutput,
+        ProverInput,
+    )],
+    pubdata_mode: PubdataMode,
+    multichain_root: alloy::primitives::B256,
+    sl_chain_id: u64,
+    batch_info: &BatchInfo,
+) -> anyhow::Result<Vec<u8>> {
+    use blake2::{Blake2s256, Digest};
+    use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
+    use zksync_os_zisk_lib::types::*;
+
+    let mut block_data_vec = Vec::with_capacity(blocks.len());
+    for (_, _, _, pi) in blocks {
+        let bytes = pi.zisk_data().expect("ZiSK data missing from ProverInput");
+        let data: ZiskBlockData = bincode1::deserialize(bytes)
+            .expect("failed to deserialize ZiSK BlockData");
+        block_data_vec.push(data);
+    }
+
+    let first = &block_data_vec[0];
+    let first_replay = &blocks.first().unwrap().1;
+    let first_ctx = &first_replay.block_context;
+    let da_scheme = pubdata_mode.da_commitment_scheme() as u8;
+
+    let pubdata: Vec<u8> = blocks
+        .iter()
+        .flat_map(|(bo, _, _, _)| bo.pubdata.iter().copied())
+        .collect();
+
+    let block_hashes_blake_before = {
+        let mut hasher = Blake2s256::new();
+        for hash in &first_ctx.block_hashes.0[1..] {
+            hasher.update(hash.to_be_bytes::<32>());
+        }
+        hasher.update(first_ctx.block_hashes.0[0].to_be_bytes::<32>());
+        alloy::primitives::B256::from_slice(&hasher.finalize())
+    };
+
+    let previous_block_hashes: Vec<alloy::primitives::B256> = first_ctx
+        .block_hashes
+        .0[1..]
+        .iter()
+        .map(|h| alloy::primitives::B256::from(h.to_be_bytes::<32>()))
+        .collect();
+
+    let upgrade_tx_hash = batch_info
+        .upgrade_tx_hash
+        .unwrap_or(alloy::primitives::B256::ZERO);
+
+    let spec_id = match crate::prover_input_generator::zisk_input_builder::spec_id_from_execution_version(
+        first_ctx.execution_version,
+    ) {
+        zksync_os_revm::ZkSpecId::AtlasV1 => 0u8,
+        zksync_os_revm::ZkSpecId::AtlasV2 => 1u8,
+    };
+
+    let batch_input = BatchInput {
+        chain_id: first_ctx.chain_id,
+        spec_id,
+        protocol_version_minor: first_replay.protocol_version.minor as u32,
+        batch_meta: BatchMeta {
+            tree_root_before: first.tree_root_before,
+            leaf_count_before: first.leaf_count_before,
+            block_number_before: first.block_number_before,
+            last_block_timestamp_before: first.previous_block_timestamp,
+            block_hashes_blake_before,
+            previous_block_hashes,
+            upgrade_tx_hash,
+            da_commitment_scheme: da_scheme,
+            pubdata,
+            multichain_root,
+            sl_chain_id,
+            blob_versioned_hashes: vec![],
+            // Single-block batch: use block's tree update directly.
+            // Multi-block: would need chaining (leaves None, guest rejects
+            // if REVM produces storage writes).
+            tree_update: if block_data_vec.len() == 1 {
+                block_data_vec[0].tree_update.clone()
+            } else {
+                None
+            },
+        },
+        blocks: block_data_vec
+            .into_iter()
+            .map(|d| d.block_input)
+            .collect(),
+    };
+
+    Ok(bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput"))
 }

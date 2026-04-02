@@ -22,6 +22,7 @@ zksync_os_multivm.workspace = true
 zksync_os_network.workspace = true
 zksync_os_integration_tests_macros.workspace = true
 zksync_os_verify_storage_proof = { path = "../tools/verify-storage-proof" }
+zksync-os-zisk-lib = { git = "https://github.com/vladbochok/zksync-os-zisk", branch = "main" }
 
 reth-tasks.workspace = true
 
@@ -40,6 +41,7 @@ backon.workspace = true
 futures.workspace = true
 serde.workspace = true
 regex = "1.11.1"
+hex = "0.4"
 smart-config.workspace = true
 serde_yaml.workspace = true
 

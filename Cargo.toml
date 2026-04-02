@@ -24,6 +24,7 @@ members = [
     "integration-tests-macros",
     "tools/generate-deposit",
     "tools/verify-storage-proof",
+    "tools/zisk-batch-test",
     "lib/observability",
     "lib/state_full_diffs",
     "lib/status",

@@ -1050,6 +1050,7 @@ async fn run_main_node_pipeline(
             pubdata_mode,
             runtime: runtime.clone(),
             disabled: !config.prover_input_generator_config.enable_input_generation,
+            enable_second_proof_system: config.prover_input_generator_config.second_proof_system,
         })
         .pipe(Batcher {
             startup_config: BatcherStartupConfig {
