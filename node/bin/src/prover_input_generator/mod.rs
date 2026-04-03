@@ -310,10 +310,14 @@ fn compute_prover_input(
         zisk_data,
     };
     let latency = prover_input_generation_latency.observe();
+    let zisk_size = prover_input.zisk_data().map(|d| d.len()).unwrap_or(0);
     tracing::info!(
         block_number,
-        "Completed prover input computation in {:?}.",
-        latency
+        zisk_data_bytes = zisk_size,
+        "Completed prover input computation in {:?}. Airbender witness: {} words, ZiSK data: {} bytes",
+        latency,
+        prover_input.unwrap_real().len(),
+        zisk_size,
     );
     prover_input
 }

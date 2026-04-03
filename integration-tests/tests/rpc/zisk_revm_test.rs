@@ -210,6 +210,7 @@ async fn zisk_revm_matches_server_output() -> anyhow::Result<()> {
             block_header_hash: B256::ZERO, storage_proofs: vec![],
             transactions, accounts, account_preimages: vec![], storage: vec![],
             bytecodes: vec![], block_hashes: vec![], l2_to_l1_logs: vec![],
+            expected_tree_root: B256::ZERO,
         }],
     };
 

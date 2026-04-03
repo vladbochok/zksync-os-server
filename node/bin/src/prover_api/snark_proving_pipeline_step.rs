@@ -32,14 +32,28 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
     ) -> (Self, Arc<SnarkJobManager>) {
+        Self::new_with_fri(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None)
+    }
+
+    pub fn new_with_fri(
+        max_fris_per_snark: usize,
+        last_proved_batch_number: u64,
+        assignment_timeout: Duration,
+        max_assigned_batch_range: usize,
+        fri_job_manager: Option<Arc<super::fri_job_manager::FriJobManager>>,
+    ) -> (Self, Arc<SnarkJobManager>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
-        let snark_job_manager = Arc::new(SnarkJobManager::new(
+        let mut sjm = SnarkJobManager::new(
             proof_commands_sender,
             max_fris_per_snark,
             assignment_timeout,
             max_assigned_batch_range,
-        ));
+        );
+        if let Some(fjm) = fri_job_manager {
+            sjm.set_fri_job_manager(fjm);
+        }
+        let snark_job_manager = Arc::new(sjm);
 
         let result = Self {
             last_proved_batch_number,

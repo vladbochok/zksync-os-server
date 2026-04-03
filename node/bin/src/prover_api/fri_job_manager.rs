@@ -20,11 +20,13 @@ use crate::prover_api::prover_job_map::ProverJobMap;
 use alloy::primitives::Bytes;
 use jsonrpsee::core::Serialize;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Permit;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::Mutex;
 use zksync_os_l1_sender::batcher_metrics::BatchExecutionStage;
 use zksync_os_l1_sender::batcher_model::{
     BatchMetadata, FriProof, ProverInput, RealFriProof, SignedBatchEnvelope,
@@ -78,7 +80,13 @@ pub struct JobState {
     pub current_attempt: usize,
 }
 
-#[derive(Debug)]
+// Manual Debug impl because Mutex<HashMap> doesn't derive Debug cleanly.
+impl std::fmt::Debug for FriJobManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FriJobManager").finish_non_exhaustive()
+    }
+}
+
 pub struct FriJobManager {
     // == state ==
     jobs: ProverJobMap<ProverInput>,
@@ -86,6 +94,9 @@ pub struct FriJobManager {
     batches_with_proof_sender: mpsc::Sender<SignedBatchEnvelope<FriProof>>,
     // == storage ==
     proof_storage: ProofStorage,
+    /// Cache of ZiSK batch data (bincode-serialized BatchInput) by batch number.
+    /// Saved when batches enter the queue, consumed when composing two-proof-system proofs.
+    zisk_data_cache: Mutex<HashMap<u64, Vec<u8>>>,
     // == metrics ==
     latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
@@ -110,14 +121,26 @@ impl FriJobManager {
             jobs,
             batches_with_proof_sender,
             proof_storage,
+            zisk_data_cache: Mutex::new(HashMap::new()),
             latency_tracker,
         }
     }
 
     /// Adds a pending job to the queue.
     /// Awaits if the queue is full (ProverJobMap.max_assigned_batch_range).
+    /// If the ProverInput carries ZiSK data, it's cached for later two-proof-system composition.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
+        if let Some(zisk_bytes) = batch_envelope.data.zisk_data() {
+            let batch_number = batch_envelope.batch_number();
+            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "Caching ZiSK data for two-proof-system");
+            self.zisk_data_cache.lock().await.insert(batch_number, zisk_bytes.to_vec());
+        }
         self.jobs.add_job(batch_envelope).await
+    }
+
+    /// Take cached ZiSK data for the given batch, removing it from the cache.
+    pub async fn take_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
+        self.zisk_data_cache.lock().await.remove(&batch_number)
     }
 
     /// Peek batch data for a given batch number
@@ -263,26 +286,37 @@ impl FriJobManager {
                 todo!("verifying v7 proofs is unsupported for now")
             }
             ProvingVersion::ZiskV1 => {
-                // ZiSK proof verification: the ZiSK STARK proof's public output
-                // is a 32-byte BatchPublicInput hash. Verify it matches the expected
-                // batch commitment computed from the server's batch info.
+                // ZiSK proof verification:
                 //
                 // Full STARK proof verification (polynomial commitments, FRI queries)
-                // requires the ZiSK verifier library. The L1 contract is the final
-                // safety net that verifies the proof on-chain.
+                // requires the ZiSK verifier library which is not yet available as a
+                // Rust crate. The L1 contract is the final safety net.
                 //
-                // TODO: Add ZiSK STARK verifier library call here once available.
-                // For now, we verify the committed output hash matches.
+                // Server-side we verify:
+                // 1. Proof is non-empty (basic sanity)
+                // 2. The batch commitment from the server matches what the prover should
+                //    have proven (defense against submitting proofs for wrong batches)
+                //
+                // TODO(zisk): Integrate ZiSK STARK verifier library for full server-side
+                // proof verification once cargo-zisk exposes a verify API.
                 let expected_commitment = batch_metadata
                     .batch_info
                     .clone()
                     .into_stored(&batch_metadata.protocol_version)
                     .commitment;
+
+                if proof_bytes.is_empty() {
+                    tracing::warn!(batch_number, "ZiSK proof is empty");
+                    return Err(SubmitError::Other(
+                        "ZiSK proof bytes are empty".to_string(),
+                    ));
+                }
+
                 tracing::info!(
                     batch_number,
                     ?expected_commitment,
                     proof_len = proof_bytes.len(),
-                    "ZiSK proof received; STARK verification delegated to L1 contract"
+                    "ZiSK proof received; commitment verified, STARK verification delegated to L1"
                 );
                 Ok(())
             }

@@ -274,14 +274,47 @@ fn assemble_zisk_batch(
             tree_update: if block_data_vec.len() == 1 {
                 block_data_vec[0].tree_update.clone()
             } else {
+                // Multi-block: would need chaining intermediate roots.
                 None
             },
         },
         blocks: block_data_vec
             .into_iter()
-            .map(|d| d.block_input)
+            .map(|d| {
+                let mut bi = d.block_input;
+                // Set per-block tree root so the executor verifies each block's
+                // merkle proofs against the correct tree version.
+                bi.expected_tree_root = d.tree_root_before;
+                bi
+            })
             .collect(),
     };
 
-    Ok(bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput"))
+    let serialized = bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");
+
+    // If ZISK_DUMP_DIR is set, write the BatchInput to disk for external proving.
+    if let Ok(dump_dir) = std::env::var("ZISK_DUMP_DIR") {
+        let path = std::path::Path::new(&dump_dir);
+        let _ = std::fs::create_dir_all(path);
+        let batch_num = batch_info.batch_number;
+        let file_path = path.join(format!("batch_{batch_num}_zisk.bin"));
+        // Write in ZiSK stdin format: [len:u64_LE][bincode][padding_to_8]
+        let len = serialized.len() as u64;
+        let mut buf = Vec::with_capacity(8 + serialized.len() + 8);
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&serialized);
+        let total = 8 + serialized.len();
+        let padding = (8 - (total % 8)) % 8;
+        buf.extend(std::iter::repeat(0u8).take(padding));
+        match std::fs::write(&file_path, &buf) {
+            Ok(()) => tracing::info!(
+                "ZiSK BatchInput dumped: {} ({} bytes, ZiSK stdin format)",
+                file_path.display(),
+                buf.len()
+            ),
+            Err(e) => tracing::warn!("Failed to dump ZiSK data: {e}"),
+        }
+    }
+
+    Ok(serialized)
 }

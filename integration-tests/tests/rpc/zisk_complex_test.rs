@@ -240,6 +240,7 @@ async fn zisk_revm_complex_transactions() -> anyhow::Result<()> {
                 account_preimages: vec![], transactions, accounts,
                 storage: vec![], bytecodes: vec![], block_hashes: vec![],
                 l2_to_l1_logs: vec![],
+                expected_tree_root: B256::ZERO,
             }],
         };
 

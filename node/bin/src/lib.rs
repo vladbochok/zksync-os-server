@@ -1003,12 +1003,23 @@ async fn run_main_node_pipeline(
         config.prover_api_config.max_assigned_batch_range,
     );
 
-    let (snark_proving_step, snark_job_manager) = SnarkProvingPipelineStep::new(
-        config.prover_api_config.max_fris_per_snark,
-        node_state_on_startup.l1_state.last_proved_batch,
-        config.prover_api_config.snark_job_timeout,
-        config.prover_api_config.max_assigned_batch_range,
-    );
+    let (snark_proving_step, snark_job_manager) = if config.prover_input_generator_config.second_proof_system {
+        tracing::info!("Two-proof-system enabled: SnarkJobManager will use ZiSK data from FriJobManager");
+        SnarkProvingPipelineStep::new_with_fri(
+            config.prover_api_config.max_fris_per_snark,
+            node_state_on_startup.l1_state.last_proved_batch,
+            config.prover_api_config.snark_job_timeout,
+            config.prover_api_config.max_assigned_batch_range,
+            Some(fri_job_manager.clone()),
+        )
+    } else {
+        SnarkProvingPipelineStep::new(
+            config.prover_api_config.max_fris_per_snark,
+            node_state_on_startup.l1_state.last_proved_batch,
+            config.prover_api_config.snark_job_timeout,
+            config.prover_api_config.max_assigned_batch_range,
+        )
+    };
 
     if config.prover_api_config.enabled {
         runtime.spawn_critical_with_graceful_shutdown_signal("prover server", |shutdown| {

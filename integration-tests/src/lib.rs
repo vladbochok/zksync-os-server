@@ -447,6 +447,7 @@ impl Tester {
             prover_input_generator_config: ProverInputGeneratorConfig {
                 logging_enabled: enable_prover,
                 enable_input_generation: enable_prover_input_generation,
+                second_proof_system: enable_prover_input_generation,
                 ..default_config.prover_input_generator_config
             },
             prover_api_config,
@@ -1157,6 +1158,35 @@ impl AnvilL1 {
         .await?;
 
         tracing::info!("L1 chain started on {}", address);
+
+        // Deploy ZiskL1Verifier by replacing the existing verifier's code on Anvil.
+        // This makes the L1 verify real ZiSK SNARK proofs for proof type 4,
+        // while still accepting fake proofs (type 3) for backward compatibility.
+        let verifier_addr: Address = "0x983201edc53eabb33dd6c6ce24389664e793f73e".parse().unwrap();
+        let artifact_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../zksync-os-zisk/contracts/out/ZiskL1Verifier.sol/ZiskL1Verifier.json");
+        if artifact_path.exists() {
+            let artifact_json: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&artifact_path).expect("read ZiskL1Verifier artifact")
+            ).expect("parse ZiskL1Verifier artifact");
+            if let Some(hex_str) = artifact_json["deployedBytecode"]["object"].as_str() {
+                let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+                let bytecode = alloy::primitives::Bytes::from(
+                    alloy::primitives::hex::decode(raw).expect("decode ZiskL1Verifier bytecode")
+                );
+                let _: () = provider.client().request("anvil_setCode", (verifier_addr, bytecode)).await
+                    .expect("failed to set ZiskL1Verifier code on Anvil");
+                tracing::info!(
+                    "Deployed ZiskL1Verifier at {verifier_addr} ({} bytes) — L1 now verifies real ZiSK proofs",
+                    raw.len() / 2
+                );
+            }
+        } else {
+            tracing::warn!(
+                "ZiskL1Verifier artifact not found at {}; L1 will use original verifier",
+                artifact_path.display()
+            );
+        }
 
         Ok(Self {
             address,

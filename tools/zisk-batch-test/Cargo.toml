@@ -16,7 +16,7 @@ zksync_os_types.workspace = true
 zksync_os_interface.workspace = true
 
 # Our ZiSK REVM executor lib
-zksync-os-zisk-lib = { git = "https://github.com/vladbochok/zksync-os-zisk", branch = "main" }
+zksync-os-zisk-lib = { path = "../../../zksync-os-zisk/lib" }
 
 # Direct RocksDB access
 rocksdb = "0.24"

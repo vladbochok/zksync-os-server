@@ -59,7 +59,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let ctx = &replay_record.block_context;
     let block_number = ctx.block_number;
     let mut tree = tree_view.clone();
-    let (root_hash, leaf_count) = tree_view.root_info()?;
+    // Get leaf_count early (stable across versions), but defer root_hash until
+    // after proof extraction to avoid race with concurrent tree updates.
+    // The underlying RocksDB is shared via Arc; another thread may apply new
+    // blocks between root_info() and merkle_proof() calls.
+    let (_initial_root, leaf_count) = tree_view.root_info()?;
     let basefee: u64 = ctx.eip1559_basefee.try_into().unwrap_or(u64::MAX);
     let prev_randao = B256::from(ctx.mix_hash.to_be_bytes::<32>());
     let spec_id = spec_id_from_execution_version(ctx.execution_version);
@@ -90,11 +94,14 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         if seen_addrs.insert(addr) {
             all_addrs.push(addr);
             if let Some(props) = state_view.get_account(addr) {
-                let code_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-                if !code_hash.is_zero() && !bytecodes_map.contains_key(&code_hash) {
-                    if let Some(code) = state_view.get_preimage(code_hash) {
-                        bytecodes_out.push((code_hash, code.clone()));
-                        bytecodes_map.insert(code_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+                let versioned_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+                if !versioned_hash.is_zero() {
+                    if let Some(code) = state_view.get_preimage(versioned_hash) {
+                        let keccak_hash = alloy::primitives::keccak256(&code);
+                        if !bytecodes_map.contains_key(&keccak_hash) {
+                            bytecodes_out.push((keccak_hash, code.clone()));
+                            bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+                        }
                     }
                 }
             }
@@ -112,6 +119,18 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     );
 
     extract_storage_read_proofs(&storage_read_keys, &mut tree, &mut proven_flat_keys, &mut storage_proofs);
+
+    // Compute actual tree root from extracted proofs. All proofs were extracted from
+    // the same tree version (even if RocksDB was updated concurrently), so they're
+    // internally consistent. Use the first proof's root recovery as the authoritative root.
+    let root_hash = if let Some((key, proof)) = storage_proofs.first() {
+        match proof.verify(key) {
+            Ok((root, _)) => root,
+            Err(_) => tree_view.root_info()?.0,  // fallback
+        }
+    } else {
+        tree_view.root_info()?.0  // no proofs, use tree directly
+    };
 
     // Phase 3: tree update
     let tree_update = if !block_output.storage_writes.is_empty() {
@@ -142,6 +161,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             bytecodes: bytecodes_out,
             block_hashes,
             l2_to_l1_logs,
+            expected_tree_root: root_hash,
         },
         tree_root_before: root_hash,
         leaf_count_before: leaf_count,
@@ -196,28 +216,35 @@ fn load_accounts_and_bytecodes(
 
     for &addr in addrs {
         if let Some(props) = state_view.get_account(addr) {
-            let code_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-            let effective = if code_hash.is_zero() {
+            let versioned_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+            // For REVM/ZiSK executor compatibility: use keccak256(code) as code_hash,
+            // not the ZKsync versioned observable_bytecode_hash.
+            let effective = if versioned_hash.is_zero() {
                 if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
+            } else if let Some(code) = state_view.get_preimage(versioned_hash) {
+                alloy::primitives::keccak256(&code)
             } else {
-                code_hash
+                versioned_hash // fallback if code not found
             };
             accounts.insert(addr, AccountInfo {
                 nonce: props.nonce, balance: props.balance, code_hash: effective,
                 code: None, account_id: None,
             });
-            if !code_hash.is_zero() && seen_hashes.insert(code_hash) {
-                if let Some(code) = state_view.get_preimage(code_hash) {
-                    bytecodes_out.push((code_hash, code.clone()));
-                    bytecodes_map.insert(code_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+            if !versioned_hash.is_zero() && seen_hashes.insert(versioned_hash) {
+                if let Some(code) = state_view.get_preimage(versioned_hash) {
+                    // Use keccak256(code) as the bytecode key for REVM compatibility.
+                    let keccak_hash = alloy::primitives::keccak256(&code);
+                    bytecodes_out.push((keccak_hash, code.clone()));
+                    bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
                 }
             }
         }
     }
     for (hash, code) in block_output.published_preimages.iter().chain(&replay_record.force_preimages) {
+        let keccak_hash = alloy::primitives::keccak256(code);
         if seen_hashes.insert(*hash) {
-            bytecodes_out.push((*hash, code.clone()));
-            bytecodes_map.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
+            bytecodes_out.push((keccak_hash, code.clone()));
+            bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(code)));
         }
     }
     (accounts, bytecodes_map, bytecodes_out)
@@ -347,6 +374,7 @@ fn extract_storage_read_proofs(
 // Phase 3: Tree update proof construction
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct LeafWithProof {
     index: u64,
     key: B256,
@@ -381,13 +409,14 @@ fn build_tree_update(
     let mut index_to_next: HashMap<u64, u64> = HashMap::new();
     let mut next_free_index = leaf_count;
 
-    // Seed the key map from leaves we discover
+    // Seed the key map from leaves we discover.
+    // Only load proofs for indices that actually exist in the tree (< leaf_count).
     let ensure_leaf = |tree: &mut MerkleTreeVersion<RocksDBWrapper>,
                            idx: u64,
                            leaf_proofs: &mut HashMap<u64, LeafWithProof>,
                            key_to_index: &mut BTreeMap<B256, u64>,
                            index_to_next: &mut HashMap<u64, u64>| {
-        if !leaf_proofs.contains_key(&idx) {
+        if idx < leaf_count && !leaf_proofs.contains_key(&idx) {
             let p = get_leaf_proof(tree, idx);
             key_to_index.insert(p.key, p.index);
             index_to_next.insert(p.index, p.next_index);
@@ -442,10 +471,52 @@ fn build_tree_update(
         .collect();
     sorted_leaves.sort_by_key(|(idx, _)| *idx);
 
-    let leaf_indices: Vec<u64> = sorted_leaves.iter().map(|(idx, _)| *idx).collect();
-    let intermediate_hashes = compute_intermediate_hashes(&leaf_indices, &leaf_proofs, leaf_count);
+    // Compute intermediate hashes for BOTH the old leaf set AND the new leaf set.
+    // apply() calls zip_leaves twice: once to verify old root, once for new root.
+    let old_leaf_indices: Vec<u64> = sorted_leaves.iter().map(|(idx, _)| *idx).collect();
 
-    BatchTreeUpdate { operations, entries, sorted_leaves, intermediate_hashes, leaf_count_before: leaf_count }
+    // Simulate apply() to determine the final leaf indices
+    let mut sim_next_index = leaf_count;
+    let mut new_indices: Vec<u64> = old_leaf_indices.clone();
+    for op in &operations {
+        if let WriteOp::Insert { .. } = op {
+            new_indices.push(sim_next_index);
+            sim_next_index += 1;
+        }
+    }
+    new_indices.sort();
+    new_indices.dedup();
+
+    // For new leaf indices (>= leaf_count), there are no tree proofs.
+    // Their siblings in the tree are empty subtrees. We need to use the
+    // tree's hash_at_position() to get the actual sibling hash at each depth.
+    // Build a function that resolves sibling hashes for ANY position.
+    // Compute separate intermediate hashes for old root verification and new root computation.
+    tracing::info!(
+        old_leaf_count = old_leaf_indices.len(),
+        new_leaf_count = new_indices.len(),
+        leaf_count_before = leaf_count,
+        leaf_count_after = sim_next_index,
+        leaf_proofs_count = leaf_proofs.len(),
+        "Computing intermediate hashes for tree update"
+    );
+    let (intermediate_hashes, intermediate_hashes_new) = compute_intermediate_hashes_full(
+        &old_leaf_indices, leaf_count,
+        &new_indices, sim_next_index,
+        &leaf_proofs, tree,
+    );
+    tracing::info!(
+        old_hashes = intermediate_hashes.len(),
+        new_hashes = intermediate_hashes_new.len(),
+        "Intermediate hashes computed"
+    );
+
+    BatchTreeUpdate {
+        operations, entries, sorted_leaves,
+        intermediate_hashes,
+        intermediate_hashes_new,
+        leaf_count_before: leaf_count,
+    }
 }
 
 /// Compute intermediate hashes by simulating the zip_leaves consumption order.
@@ -498,6 +569,118 @@ fn compute_intermediate_hashes(
         last_idx_on_level /= 2;
     }
     result
+}
+
+/// Compute intermediate hashes for both old and new leaf sets.
+/// Uses the tree directly to resolve sibling hashes at any position.
+fn compute_intermediate_hashes_full(
+    old_indices: &[u64],
+    old_leaf_count: u64,
+    new_indices: &[u64],
+    new_leaf_count: u64,
+    leaf_proofs: &HashMap<u64, LeafWithProof>,
+    tree: &mut MerkleTreeVersion<RocksDBWrapper>,
+) -> (Vec<B256>, Vec<B256>) {
+    let empty_hashes = zisk_merkle::empty_subtree_hashes_vec();
+
+    // Build sibling cache from already-loaded proofs.
+    // Key: (depth, node_index_at_that_depth) → hash of that node
+    let mut sibling_cache: HashMap<(u8, u64), B256> = HashMap::new();
+    for proof in leaf_proofs.values() {
+        for d in 0..TREE_DEPTH {
+            let sibling_node = (proof.index >> d) ^ 1;
+            sibling_cache.entry((d, sibling_node)).or_insert(proof.siblings[d as usize]);
+        }
+    }
+
+    // Function to resolve sibling hash, loading from tree if necessary.
+    // We pass tree as a mutable reference so we can load new proofs on demand.
+    let mut resolve_sibling = |depth: u8, sibling_node: u64, leaf_count: u64| -> B256 {
+        // Check cache first
+        if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
+            return h;
+        }
+        // Beyond tree → empty subtree
+        let range_start = sibling_node << depth;
+        if range_start >= leaf_count {
+            return empty_hashes[depth as usize];
+        }
+        // Load a proof from a leaf in this subtree to populate cache
+        let leaf_in_subtree = range_start.min(old_leaf_count.saturating_sub(1));
+        if leaf_in_subtree < old_leaf_count {
+            let p = get_leaf_proof(tree, leaf_in_subtree);
+            for d in 0..TREE_DEPTH {
+                let sn = (p.index >> d) ^ 1;
+                sibling_cache.entry((d, sn)).or_insert(p.siblings[d as usize]);
+            }
+            if let Some(&h) = sibling_cache.get(&(depth, sibling_node)) {
+                return h;
+            }
+        }
+        empty_hashes[depth as usize]
+    };
+
+    // Simulate zip_leaves for old leaf set
+    let mut old_hashes = Vec::new();
+    {
+        let mut node_indices: Vec<u64> = old_indices.to_vec();
+        let mut last_idx = old_leaf_count - 1;
+        for depth in 0..TREE_DEPTH {
+            let mut i = 0;
+            let mut next_level = Vec::new();
+            while i < node_indices.len() {
+                let idx = node_indices[i];
+                if idx % 2 == 1 {
+                    old_hashes.push(resolve_sibling(depth, idx - 1, old_leaf_count));
+                    next_level.push(idx / 2);
+                    i += 1;
+                } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
+                    next_level.push(idx / 2);
+                    i += 2;
+                } else {
+                    if idx != last_idx {
+                        old_hashes.push(resolve_sibling(depth, idx + 1, old_leaf_count));
+                    }
+                    next_level.push(idx / 2);
+                    i += 1;
+                }
+            }
+            node_indices = next_level;
+            last_idx /= 2;
+        }
+    }
+
+    // Simulate zip_leaves for new leaf set
+    let mut new_hashes = Vec::new();
+    {
+        let mut node_indices: Vec<u64> = new_indices.to_vec();
+        let mut last_idx = new_leaf_count - 1;
+        for depth in 0..TREE_DEPTH {
+            let mut i = 0;
+            let mut next_level = Vec::new();
+            while i < node_indices.len() {
+                let idx = node_indices[i];
+                if idx % 2 == 1 {
+                    new_hashes.push(resolve_sibling(depth, idx - 1, new_leaf_count));
+                    next_level.push(idx / 2);
+                    i += 1;
+                } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
+                    next_level.push(idx / 2);
+                    i += 2;
+                } else {
+                    if idx != last_idx {
+                        new_hashes.push(resolve_sibling(depth, idx + 1, new_leaf_count));
+                    }
+                    next_level.push(idx / 2);
+                    i += 1;
+                }
+            }
+            node_indices = next_level;
+            last_idx /= 2;
+        }
+    }
+
+    (old_hashes, new_hashes)
 }
 
 // ---------------------------------------------------------------------------

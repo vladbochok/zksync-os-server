@@ -17,7 +17,7 @@ use crate::prover_api::{
         AppState,
         v1::models::{
             BatchDataPayload, FailedProofResponse, FriProofPayload, NextSnarkProverJobPayload,
-            ProverQuery, SnarkProofPayload,
+            ProverQuery, SnarkProofPayload, TwoProofSystemPayload, ZiskBatchDataPayload,
         },
     },
 };
@@ -334,6 +334,97 @@ pub(super) async fn peek_snark_job(
 pub(super) async fn status(State(state): State<AppState>) -> Response {
     let status = state.fri_job_manager.status().await;
     Json(status).into_response()
+}
+
+/// Peek ZiSK batch data for a given batch number.
+/// Returns the bincode-serialized BatchInput for the ZiSK prover.
+pub(super) async fn peek_zisk_data(
+    Path(batch_number): Path<u64>,
+    State(state): State<AppState>,
+) -> Response {
+    match state.fri_job_manager.peek_batch_data(batch_number).await {
+        Some((vk_hash, prover_input)) => {
+            match prover_input.zisk_data() {
+                Some(zisk_bytes) => {
+                    Json(ZiskBatchDataPayload {
+                        batch_number,
+                        vk_hash: vk_hash.to_string(),
+                        zisk_data: general_purpose::STANDARD.encode(zisk_bytes),
+                    })
+                    .into_response()
+                }
+                None => {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Batch {batch_number} has no ZiSK data (second_proof_system not enabled?)"),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => {
+            // Also check proof storage for completed batches
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
+}
+
+/// Submit a two-proof-system proof (Era SNARK + ZiSK SNARK combined).
+pub(super) async fn submit_two_proof_system(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+    Json(payload): Json<TwoProofSystemPayload>,
+) -> Result<Response, (StatusCode, String)> {
+    let start = Instant::now();
+    tracing::debug!(
+        "Received two-proof-system submit from prover with ID: {}",
+        query.id
+    );
+
+    let era_proof = general_purpose::STANDARD
+        .decode(&payload.era_proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid era_proof base64: {e}")))?;
+    let zisk_proof = general_purpose::STANDARD
+        .decode(&payload.zisk_proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid zisk_proof base64: {e}")))?;
+    let zisk_public_values = general_purpose::STANDARD
+        .decode(&payload.zisk_public_values)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid zisk_public_values base64: {e}"),
+            )
+        })?;
+
+    let proving_version = ProvingVersion::try_from_vk_hash(&payload.vk_hash).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("no Proving Version matches the provided verification key: {e}"),
+        )
+    })?;
+
+    let result = match state
+        .snark_job_manager
+        .submit_two_proof_system(
+            payload.from_batch_number,
+            payload.to_batch_number,
+            proving_version,
+            era_proof,
+            zisk_proof,
+            zisk_public_values,
+            query.id,
+        )
+        .await
+    {
+        Ok(()) => Ok((StatusCode::NO_CONTENT, "two-proof-system proof accepted".to_string())
+            .into_response()),
+        Err(err) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("two-proof-system proof rejected: {err}"),
+        )),
+    };
+    PROVER_API_METRICS.submit_proof_latency[&ProverStage::Snark].observe(start.elapsed());
+    result
 }
 
 /// Get detailed information about a failed FRI proof for debugging.

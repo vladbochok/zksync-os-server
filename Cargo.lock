@@ -13941,7 +13941,6 @@ dependencies = [
 [[package]]
 name = "zksync-os-zisk-lib"
 version = "0.1.0"
-source = "git+https://github.com/vladbochok/zksync-os-zisk?branch=main#242686530fcb45b71381fbf0ac5d0e2b1c05abf5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -14159,6 +14158,7 @@ dependencies = [
  "async-trait",
  "backon",
  "basic_system 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
+ "bincode 1.3.3",
  "flate2",
  "fs2",
  "futures",

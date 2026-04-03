@@ -53,7 +53,7 @@ zksync_os_config_validation_macros.workspace = true
 zk_ee.workspace = true
 zk_os_forward_system.workspace = true
 
-zksync-os-zisk-lib = { git = "https://github.com/vladbochok/zksync-os-zisk", branch = "main" }
+zksync-os-zisk-lib = { path = "../../../zksync-os-zisk/lib" }
 zksync-os-revm.workspace = true
 revm = { version = "=34.0.0", default-features = false, features = ["std"] }
 
