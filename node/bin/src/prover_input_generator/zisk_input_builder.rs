@@ -20,7 +20,7 @@ use zksync_os_interface::types::BlockOutput;
 use zksync_os_merkle_tree::{MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
 use zksync_os_revm::{DefaultZk, ZKsyncTx, ZkBuilder, ZkContext, ZkSpecId};
-use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, ViewState};
+use zksync_os_storage_api::{OverriddenStateView, ReadStateHistory, ReplayRecord, ViewState};
 use zksync_os_types::{ExecutionVersion, ZkEnvelope, ZkTransaction};
 
 use serde::{Deserialize, Serialize};
@@ -73,9 +73,21 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     // Phase 1: collect addresses + pre-execute to discover storage reads
     let initial_addrs = collect_touched_addresses(replay_record, block_output, ctx.coinbase);
     let mut state_view = read_state.state_view_at(block_number - 1)?;
+    // Create a state view with published preimages as overrides.
+    // This resolves system contract bytecodes for genesis/upgrade blocks where
+    // preimages are published during execution but aren't in the state view at block N-1.
+    let all_preimages: Vec<(B256, Vec<u8>)> = block_output.published_preimages
+        .iter()
+        .chain(&replay_record.force_preimages)
+        .cloned()
+        .collect();
+    let mut state_with_preimages = zksync_os_storage_api::OverriddenStateView::with_preimages(
+        state_view.clone(),
+        &all_preimages,
+    );
 
     let (accounts_map, mut bytecodes_map, mut bytecodes_out) =
-        load_accounts_and_bytecodes(&initial_addrs, &mut state_view, block_output, replay_record);
+        load_accounts_and_bytecodes(&initial_addrs, &mut state_with_preimages, block_output, replay_record);
 
     let storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
 
@@ -203,9 +215,9 @@ fn collect_touched_addresses(
     addrs
 }
 
-fn load_accounts_and_bytecodes(
+fn load_accounts_and_bytecodes<S: ViewState>(
     addrs: &[Address],
-    state_view: &mut impl ViewState,
+    state_view: &mut S,
     block_output: &BlockOutput,
     replay_record: &ReplayRecord,
 ) -> (HashMap<Address, AccountInfo>, HashMap<B256, Bytecode>, Vec<(B256, Vec<u8>)>) {
@@ -246,13 +258,16 @@ fn load_accounts_and_bytecodes(
                 nonce: props.nonce, balance: props.balance, code_hash: effective,
                 code: None, account_id: None,
             });
-            if !versioned_hash.is_zero() && seen_hashes.insert(versioned_hash) {
+            if !versioned_hash.is_zero() {
                 if let Some(code) = state_view.get_preimage(versioned_hash) {
-                    // Use keccak256(code) as the bytecode key for REVM compatibility.
-                    let keccak_hash = alloy::primitives::keccak256(&code);
-                    bytecodes_out.push((keccak_hash, code.clone()));
-                    bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+                    if seen_hashes.insert(versioned_hash) {
+                        let keccak_hash = alloy::primitives::keccak256(&code);
+                        bytecodes_out.push((keccak_hash, code.clone()));
+                        bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+                    }
                 }
+                // Don't add to seen_hashes if preimage not found — the bytecodes loop
+                // (published_preimages + force_preimages) may resolve it later.
             }
         }
     }
