@@ -214,6 +214,19 @@ fn load_accounts_and_bytecodes(
     let mut bytecodes_out = Vec::new();
     let mut seen_hashes = HashSet::new();
 
+    // Build a lookup for force_preimages (system contract bytecodes from upgrade tx)
+    let force_preimage_map: HashMap<B256, &Vec<u8>> = block_output.published_preimages
+        .iter()
+        .chain(&replay_record.force_preimages)
+        .map(|(h, c)| (*h, c))
+        .collect();
+    if !force_preimage_map.is_empty() {
+        tracing::debug!(
+            count = force_preimage_map.len(),
+            "Force preimages available for bytecode resolution"
+        );
+    }
+
     for &addr in addrs {
         if let Some(props) = state_view.get_account(addr) {
             let versioned_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
@@ -223,8 +236,11 @@ fn load_accounts_and_bytecodes(
                 if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
             } else if let Some(code) = state_view.get_preimage(versioned_hash) {
                 alloy::primitives::keccak256(&code)
+            } else if let Some(code) = force_preimage_map.get(&versioned_hash) {
+                // System contract bytecodes from force_preimages (upgrade tx)
+                alloy::primitives::keccak256(code)
             } else {
-                versioned_hash // fallback if code not found
+                versioned_hash // fallback if code not found anywhere
             };
             accounts.insert(addr, AccountInfo {
                 nonce: props.nonce, balance: props.balance, code_hash: effective,
@@ -240,6 +256,8 @@ fn load_accounts_and_bytecodes(
             }
         }
     }
+    // Load force_preimages (system contract bytecodes from upgrade/genesis) into bytecodes.
+    // These must be loaded BEFORE pre-execution so the TrackingDB can trace system calls.
     for (hash, code) in block_output.published_preimages.iter().chain(&replay_record.force_preimages) {
         let keccak_hash = alloy::primitives::keccak256(code);
         if seen_hashes.insert(*hash) {
