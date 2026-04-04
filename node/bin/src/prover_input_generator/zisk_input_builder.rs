@@ -106,13 +106,19 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         if seen_addrs.insert(addr) {
             all_addrs.push(addr);
             if let Some(props) = state_view.get_account(addr) {
-                let versioned_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-                if !versioned_hash.is_zero() {
-                    if let Some(code) = state_view.get_preimage(versioned_hash) {
-                        let keccak_hash = alloy::primitives::keccak256(&code);
-                        if !bytecodes_map.contains_key(&keccak_hash) {
-                            bytecodes_out.push((keccak_hash, code.clone()));
-                            bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+                let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
+                let observable_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+                if !preimage_hash.is_zero() && !observable_hash.is_zero() {
+                    if let Some(padded_code) = state_view.get_preimage(preimage_hash) {
+                        let raw_len = props.unpadded_code_len as usize;
+                        let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
+                            &padded_code[..raw_len]
+                        } else {
+                            &padded_code[..]
+                        };
+                        if !bytecodes_map.contains_key(&observable_hash) {
+                            bytecodes_out.push((observable_hash, raw_code.to_vec()));
+                            bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                         }
                     }
                 }
@@ -241,33 +247,40 @@ fn load_accounts_and_bytecodes<S: ViewState>(
 
     for &addr in addrs {
         if let Some(props) = state_view.get_account(addr) {
-            let versioned_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-            // For REVM/ZiSK executor compatibility: use keccak256(code) as code_hash,
-            // not the ZKsync versioned observable_bytecode_hash.
-            let effective = if versioned_hash.is_zero() {
+            // AccountProperties has two hashes:
+            // - bytecode_hash (blake2s256 of padded code) — used for preimage DB lookup
+            // - observable_bytecode_hash (keccak256 of raw code) — the EVM-visible code_hash
+            // REVM uses keccak256 as code_hash, so we use observable_bytecode_hash.
+            let observable_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+            let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
+
+            let effective = if observable_hash.is_zero() {
                 if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
-            } else if let Some(code) = state_view.get_preimage(versioned_hash) {
-                alloy::primitives::keccak256(&code)
-            } else if let Some(code) = force_preimage_map.get(&versioned_hash) {
-                // System contract bytecodes from force_preimages (upgrade tx)
-                alloy::primitives::keccak256(code)
             } else {
-                versioned_hash // fallback if code not found anywhere
+                observable_hash // keccak256 of raw code — correct for REVM
             };
             accounts.insert(addr, AccountInfo {
                 nonce: props.nonce, balance: props.balance, code_hash: effective,
                 code: None, account_id: None,
             });
-            if !versioned_hash.is_zero() {
-                if let Some(code) = state_view.get_preimage(versioned_hash) {
-                    if seen_hashes.insert(versioned_hash) {
-                        let keccak_hash = alloy::primitives::keccak256(&code);
-                        bytecodes_out.push((keccak_hash, code.clone()));
-                        bytecodes_map.insert(keccak_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code)));
+            // Load bytecode: preimage DB stores (blake2s256(padded), padded_code).
+            // REVM needs (keccak256(raw), raw_code). Extract raw code by truncating
+            // padding using unpadded_code_len from AccountProperties.
+            if !preimage_hash.is_zero() && !observable_hash.is_zero() {
+                if let Some(padded_code) = state_view.get_preimage(preimage_hash) {
+                    // Extract raw EVM code by truncating at unpadded_code_len
+                    let raw_len = props.unpadded_code_len as usize;
+                    let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
+                        &padded_code[..raw_len]
+                    } else {
+                        &padded_code
+                    };
+                    // observable_hash = keccak256(raw_code) — use it as the key
+                    if seen_hashes.insert(preimage_hash) {
+                        bytecodes_out.push((observable_hash, raw_code.to_vec()));
+                        bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
                     }
                 }
-                // Don't add to seen_hashes if preimage not found — the bytecodes loop
-                // (published_preimages + force_preimages) may resolve it later.
             }
         }
     }
