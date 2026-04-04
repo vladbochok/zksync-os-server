@@ -91,7 +91,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     let storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
 
-    let (storage_read_keys, extra_addrs) = pre_execute_for_reads(
+    let (storage_read_keys, extra_addrs, storage_reads) = pre_execute_for_reads(
         ctx, spec_id, basefee, prev_randao, &transactions, block_output,
         &accounts_map, &storage_prestate, &bytecodes_map,
         state_view,
@@ -175,7 +175,18 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             account_preimages,
             transactions,
             accounts: accounts_out,
-            storage: storage_out,
+            storage: {
+                // Merge write prestates with read values from pre-execution.
+                // This ensures REVM's SimpleDB has both read and write slot values.
+                let mut all_storage = storage_out;
+                let existing: HashSet<(Address, U256)> = all_storage.iter().map(|(a, s, _)| (*a, *s)).collect();
+                for (addr, slot, val) in &storage_reads {
+                    if !existing.contains(&(*addr, *slot)) {
+                        all_storage.push((*addr, *slot, *val));
+                    }
+                }
+                all_storage
+            },
             bytecodes: bytecodes_out,
             block_hashes,
             l2_to_l1_logs,
@@ -318,7 +329,8 @@ fn load_storage_prestate(
 // Phase 1: Pre-execution for read tracking
 // ---------------------------------------------------------------------------
 
-/// Returns (storage_read_flat_keys, extra_account_addresses).
+/// Returns (storage_read_flat_keys, extra_account_addresses, storage_reads).
+/// storage_reads: (address, slot, value) for all storage accessed during pre-execution.
 fn pre_execute_for_reads(
     ctx: &zksync_os_interface::types::BlockContext,
     spec_id: ZkSpecId,
@@ -330,9 +342,10 @@ fn pre_execute_for_reads(
     storage_prestate: &HashMap<(Address, U256), U256>,
     bytecodes: &HashMap<B256, Bytecode>,
     state_view: impl ViewState,
-) -> (HashSet<B256>, HashSet<Address>) {
+) -> (HashSet<B256>, HashSet<Address>, Vec<(Address, U256, U256)>) {
     let read_keys: RefCell<HashSet<B256>> = RefCell::new(HashSet::new());
     let read_accounts: RefCell<HashSet<Address>> = RefCell::new(HashSet::new());
+    let read_storage: RefCell<Vec<(Address, U256, U256)>> = RefCell::new(Vec::new());
 
     let tracking_db = TrackingDB {
         accounts, storage_prestate,
@@ -342,6 +355,7 @@ fn pre_execute_for_reads(
         block_number: ctx.block_number,
         read_keys: &read_keys,
         read_accounts: &read_accounts,
+        read_storage: &read_storage,
     };
 
     let cache_db = CacheDB::new(tracking_db);
@@ -350,7 +364,7 @@ fn pre_execute_for_reads(
         basefee, ctx.gas_limit, prev_randao, transactions, block_output, cache_db,
     );
 
-    (read_keys.into_inner(), read_accounts.into_inner())
+    (read_keys.into_inner(), read_accounts.into_inner(), read_storage.into_inner())
 }
 
 // ---------------------------------------------------------------------------
@@ -870,6 +884,9 @@ struct TrackingDB<'a, S> {
     block_number: u64,
     read_keys: &'a RefCell<HashSet<B256>>,
     read_accounts: &'a RefCell<HashSet<Address>>,
+    /// Storage reads captured during pre-execution: (address, slot, value).
+    /// Used to populate block.storage for the unverified execution path.
+    read_storage: &'a RefCell<Vec<(Address, U256, U256)>>,
 }
 
 #[derive(Debug)]
@@ -896,13 +913,15 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
         let flat_key = zisk_merkle::derive_flat_storage_key(&address.into_array(), &B256::from(index.to_be_bytes::<32>()));
         self.read_keys.borrow_mut().insert(flat_key);
 
-        if let Some(&val) = self.storage_prestate.get(&(address, index)) {
-            return Ok(val);
-        }
-        // Read directly using flat_key — no roundtrip (#2)
-        let val = self.state_view.borrow_mut().read(flat_key)
-            .map(|v| U256::from_be_bytes(v.0))
-            .unwrap_or(U256::ZERO);
+        let val = if let Some(&val) = self.storage_prestate.get(&(address, index)) {
+            val
+        } else {
+            self.state_view.borrow_mut().read(flat_key)
+                .map(|v| U256::from_be_bytes(v.0))
+                .unwrap_or(U256::ZERO)
+        };
+        // Capture read for SimpleDB storage population
+        self.read_storage.borrow_mut().push((address, index, val));
         Ok(val)
     }
 
