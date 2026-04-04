@@ -44,20 +44,6 @@ pub(super) struct ZiskBatchDataPayload {
     pub zisk_data: String,
 }
 
-/// Payload for submitting a two-proof-system proof (Era SNARK + ZiSK SNARK).
-#[derive(Debug, Serialize, Deserialize)]
-pub(super) struct TwoProofSystemPayload {
-    pub from_batch_number: u64,
-    pub to_batch_number: u64,
-    pub vk_hash: String,
-    /// Era SNARK proof bytes (base64-encoded).
-    pub era_proof: String,
-    /// ZiSK SNARK proof bytes (base64-encoded, exactly 768 bytes decoded).
-    pub zisk_proof: String,
-    /// ZiSK public values (base64-encoded, exactly 256 bytes decoded).
-    pub zisk_public_values: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct FailedProofResponse {
     pub batch_number: u64,

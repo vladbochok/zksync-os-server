@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use zksync_os_l1_sender::batcher_metrics::BatchExecutionStage;
 use zksync_os_l1_sender::batcher_model::{
-    FriProof, RealSnarkProof, SignedBatchEnvelope, SnarkProof, TwoProofSystemSnarkProof,
+    FriProof, MultiProofSnarkProof, RealSnarkProof, SignedBatchEnvelope, SnarkProof,
 };
 use zksync_os_l1_sender::commands::prove::ProofCommand;
 use zksync_os_observability::{
@@ -35,9 +35,7 @@ pub struct SnarkJobManager {
     // config
     max_fris_per_snark: usize,
     /// Reference to FriJobManager for accessing cached ZiSK data.
-    #[allow(dead_code)]
     fri_job_manager: Option<Arc<FriJobManager>>,
-    // Note: FriJobManager is not Debug, so we skip it in auto-derive.
     // metrics
     latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
@@ -103,6 +101,11 @@ impl SnarkJobManager {
         Ok(Some(batches_with_real_proofs))
     }
 
+    /// Submit a real Airbender SNARK proof from an external prover.
+    ///
+    /// If ZiSK data is available for the batch, generates the ZiSK SNARK proof
+    /// and combines both into a MultiProof (type 5) for on-chain verification.
+    /// Otherwise, submits the Airbender proof alone (type 2).
     pub async fn submit_proof(
         &self,
         batch_from: u64,
@@ -111,15 +114,6 @@ impl SnarkJobManager {
         payload: Vec<u8>,
         prover_id: String,
     ) -> anyhow::Result<()> {
-        // note: we still hold mutex while verifying the proof -
-        // this is desired since we don't want the batches to timeout
-
-        // todo: verify_snark_proof()
-        // if false {
-        //     anyhow::bail!("proof validation failed")
-        // }
-
-        // prove is valid - consuming proven batches
         let Some(consumed_batches_proven) = self
             .jobs
             .complete_many_jobs(batch_from, batch_to, ProverType::Real, &prover_id)
@@ -128,10 +122,6 @@ impl SnarkJobManager {
             anyhow::bail!("race condition: some batches were completed earlier")
         };
 
-        // Prover should generate the proof with VK received from server. These must always match.
-        // If they don't, proof won't be accepted, validation will fail, therefore it's pointless to proceed.
-        //
-        // This should never happen, but we double-check to guarantee it's the case.
         let server_vk = consumed_batches_proven[0]
             .batch
             .verification_key_hash()
@@ -142,83 +132,57 @@ impl SnarkJobManager {
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
-        let consumed_batches_proven: Vec<_> = consumed_batches_proven
-            .into_iter()
-            .map(|batch| batch.with_stage(BatchExecutionStage::SnarkProvedReal))
-            .collect();
+        // Check if ZiSK data is available — if so, generate ZiSK SNARK and combine.
+        let zisk_data = if let Some(ref fjm) = self.fri_job_manager {
+            fjm.take_zisk_data(batch_from).await
+        } else {
+            None
+        };
 
-        self.send_downstream(ProofCommand::new(
-            consumed_batches_proven,
+        let snark_proof = if let Some(zisk_bincode) = zisk_data {
+            tracing::info!(
+                batch = batch_from,
+                "Generating ZiSK SNARK to combine with Airbender proof"
+            );
+            let batch_num = batch_from;
+            let zisk_result = tokio::task::spawn_blocking(move || {
+                generate_zisk_snark_proof(&zisk_bincode, batch_num)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("ZiSK spawn_blocking: {e}"))?;
+
+            match zisk_result {
+                Ok((zisk_proof, zisk_public_values)) => {
+                    tracing::info!(batch = batch_from, "Combined Airbender + ZiSK multi-proof ready");
+                    SnarkProof::MultiProof(MultiProofSnarkProof {
+                        era_proof: payload,
+                        zisk_proof,
+                        zisk_public_values,
+                        proving_execution_version: proving_version as u32,
+                    })
+                }
+                Err(e) => {
+                    tracing::error!(batch = batch_from, "ZiSK SNARK failed: {e}, falling back to Airbender-only");
+                    SnarkProof::Real(RealSnarkProof::V2 {
+                        proof: payload,
+                        proving_execution_version: proving_version as u32,
+                    })
+                }
+            }
+        } else {
             SnarkProof::Real(RealSnarkProof::V2 {
                 proof: payload,
                 proving_execution_version: proving_version as u32,
-            }),
-        ))
-        .await?;
-        Ok(())
-    }
-
-    /// Submit a two-proof-system proof (Era SNARK + ZiSK SNARK).
-    /// Combines both proofs into a single TwoProofSystem variant for L1 submission.
-    pub async fn submit_two_proof_system(
-        &self,
-        batch_from: u64,
-        batch_to: u64,
-        proving_version: ProvingVersion,
-        era_proof: Vec<u8>,
-        zisk_proof: Vec<u8>,
-        zisk_public_values: Vec<u8>,
-        prover_id: String,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            zisk_proof.len() == 768,
-            "ZiSK proof must be exactly 768 bytes (24 * 32), got {}",
-            zisk_proof.len()
-        );
-        anyhow::ensure!(
-            zisk_public_values.len() == 256,
-            "ZiSK public values must be exactly 256 bytes (8 * 32), got {}",
-            zisk_public_values.len()
-        );
-        anyhow::ensure!(
-            era_proof.len() % 32 == 0,
-            "Era proof must be a multiple of 32 bytes, got {}",
-            era_proof.len()
-        );
-
-        let Some(consumed_batches_proven) = self
-            .jobs
-            .complete_many_jobs(batch_from, batch_to, ProverType::Real, &prover_id)
-            .await
-        else {
-            anyhow::bail!("race condition: some batches were completed earlier")
+            })
         };
-
-        let server_vk = consumed_batches_proven[0]
-            .batch
-            .verification_key_hash()
-            .expect("verification key hash must be present");
-        let prover_vk = proving_version.vk_hash();
-        anyhow::ensure!(
-            server_vk == prover_vk,
-            "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
-        );
 
         let consumed_batches_proven: Vec<_> = consumed_batches_proven
             .into_iter()
             .map(|batch| batch.with_stage(BatchExecutionStage::SnarkProvedReal))
             .collect();
 
-        self.send_downstream(ProofCommand::new(
-            consumed_batches_proven,
-            SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
-                era_proof,
-                zisk_proof,
-                zisk_public_values,
-                proving_execution_version: proving_version as u32,
-            }),
-        ))
-        .await?;
+        self.send_downstream(ProofCommand::new(consumed_batches_proven, snark_proof))
+            .await?;
         Ok(())
     }
 
@@ -271,103 +235,13 @@ impl SnarkJobManager {
                 }
             }
 
-            // Check if ZiSK data is available for two-proof-system.
-            // If so, execute ZiSK batch natively to compute commitment and include it.
-            let first_batch = completed.first().unwrap().batch_number();
-            let zisk_data = if let Some(ref fjm) = self.fri_job_manager {
-                fjm.take_zisk_data(first_batch).await
-            } else {
-                None
-            };
-
-            let snark_proof = if let Some(zisk_bincode) = zisk_data {
-                let real_snark = std::env::var("ZISK_REAL_PROOFS").is_ok();
-                if real_snark {
-                    // Generate real ZiSK SNARK proof by running the full pipeline.
-                    // This is CPU-intensive (~15 min), so run on a blocking thread.
-                    tracing::info!(batch = first_batch, "Starting REAL ZiSK proof generation ({} bytes input)", zisk_bincode.len());
-                } else {
-                    tracing::info!(batch = first_batch, "Computing ZiSK batch commitment (set ZISK_REAL_PROOFS=1 for real SNARK)");
-                }
-                let batch_num = first_batch;
-                let result = if real_snark {
-                    tokio::task::spawn_blocking(move || {
-                        generate_zisk_snark_proof(&zisk_bincode, batch_num)
-                    }).await.map_err(|e| format!("spawn_blocking: {e}"))
-                } else {
-                    // Native commitment computation only — timeout after 120s
-                    let handle = tokio::task::spawn_blocking(move || {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            zksync_os_zisk_lib::executor::execute_and_commit_from_bincode(&zisk_bincode)
-                        })) {
-                            Ok(Ok((_output, commitment))) => {
-                                let hash_bytes: [u8; 32] = commitment.into();
-                                let mut pv = vec![0u8; 256];
-                                pv[..32].copy_from_slice(&hash_bytes);
-                                Ok((vec![0u8; 768], pv))
-                            }
-                            Ok(Err(e)) => Err(e),
-                            Err(panic_info) => {
-                                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
-                                    s.clone()
-                                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-                                    s.to_string()
-                                } else {
-                                    "unknown panic".to_string()
-                                };
-                                Err(format!("ZiSK execution panicked: {msg}"))
-                            }
-                        }
-                    });
-                    match tokio::time::timeout(Duration::from_secs(120), handle).await {
-                        Ok(join_result) => join_result.map_err(|e| format!("spawn_blocking: {e}")),
-                        Err(_) => Err("ZiSK commitment computation timed out (120s)".to_string()),
-                    }
-                };
-                match result.and_then(|r| r) {
-                    Ok((snark_proof_bytes, public_values)) => {
-                        let is_real = snark_proof_bytes.iter().any(|&b| b != 0);
-                        tracing::info!(
-                            batch = first_batch,
-                            real_snark = is_real,
-                            commitment = %alloy::primitives::B256::from_slice(&public_values[..32]),
-                            "ZiSK proof ready"
-                        );
-                        if is_real {
-                            SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
-                                era_proof: vec![0u8; 32],
-                            zisk_proof: snark_proof_bytes,
-                            zisk_public_values: public_values,
-                            proving_execution_version: completed
-                                .first()
-                                .unwrap()
-                                .batch
-                                .execution_version,
-                        })
-                        } else {
-                            // Commitment computed but no real SNARK — use fake proof for L1
-                            SnarkProof::Fake
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(batch = first_batch, "ZiSK proof generation failed: {e}");
-                        SnarkProof::Fake
-                    }
-                }
-            } else {
-                SnarkProof::Fake
-            };
-
             let batches_with_fake_proofs = completed
                 .into_iter()
                 .map(|batch| batch.with_stage(BatchExecutionStage::SnarkProvedFake))
                 .collect();
 
-            self.send_downstream(ProofCommand::new(
-                batches_with_fake_proofs,
-                snark_proof,
-            ))
-            .await?;
+            self.send_downstream(ProofCommand::new(batches_with_fake_proofs, SnarkProof::Fake))
+                .await?;
         }
     }
 
@@ -407,7 +281,6 @@ fn generate_zisk_snark_proof(
     let proving_key = format!("{home}/.zisk/provingKey");
     let snark_key = format!("{home}/.zisk/provingKeySnark");
 
-    // Create temp directory for this batch
     let work_dir = format!("/tmp/zisk_prove_batch_{batch_number}");
     let _ = std::fs::create_dir_all(&work_dir);
 
@@ -424,49 +297,61 @@ fn generate_zisk_snark_proof(
         std::fs::write(&input_path, &buf).map_err(|e| format!("write input: {e}"))?;
     }
 
-    // Run STARK aggregation
+    // STARK aggregation
     let stark_dir = format!("{work_dir}/stark");
     let _ = std::fs::create_dir_all(format!("{stark_dir}/proofs"));
-    tracing::info!(batch_number, "Running STARK aggregation...");
+    tracing::info!(batch_number, "Running ZiSK STARK aggregation...");
     let stark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
         .args([
-            "prove", "-e", &elf_path, "-i", &input_path, "-k", &proving_key,
-            "-o", &stark_dir, "--emulator", "--aggregation", "--save-proofs", "-v",
+            "prove", "-e", &elf_path, "-i", &input_path, "-k", &proving_key, "-o", &stark_dir,
+            "--emulator", "--aggregation", "--save-proofs", "-v",
         ])
         .output()
         .map_err(|e| format!("cargo-zisk prove: {e}"))?;
     if !stark_output.status.success() {
         let stderr = String::from_utf8_lossy(&stark_output.stderr);
-        return Err(format!("STARK aggregation failed: {}", &stderr[stderr.len().saturating_sub(500)..]));
+        return Err(format!(
+            "STARK aggregation failed: {}",
+            &stderr[stderr.len().saturating_sub(500)..]
+        ));
     }
     let vadcop_path = format!("{stark_dir}/vadcop_final_proof.bin");
     if !std::path::Path::new(&vadcop_path).exists() {
         return Err("vadcop_final_proof.bin not generated".into());
     }
-    tracing::info!(batch_number, "STARK aggregation done");
 
-    // Run SNARK wrapping
+    // SNARK wrapping
     let snark_dir = format!("{work_dir}/snark");
     let _ = std::fs::create_dir_all(&snark_dir);
-    tracing::info!(batch_number, "Running SNARK wrapping...");
+    tracing::info!(batch_number, "Running ZiSK SNARK wrapping...");
     let snark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
         .args([
-            "prove-snark", "--proof", &vadcop_path, "--elf", &elf_path,
-            "--proving-key-snark", &snark_key, "-o", &snark_dir, "-v",
+            "prove-snark",
+            "--proof",
+            &vadcop_path,
+            "--elf",
+            &elf_path,
+            "--proving-key-snark",
+            &snark_key,
+            "-o",
+            &snark_dir,
+            "-v",
         ])
         .output()
         .map_err(|e| format!("cargo-zisk prove-snark: {e}"))?;
     if !snark_output.status.success() {
         let stderr = String::from_utf8_lossy(&snark_output.stderr);
-        return Err(format!("SNARK wrapping failed: {}", &stderr[stderr.len().saturating_sub(500)..]));
+        return Err(format!(
+            "SNARK wrapping failed: {}",
+            &stderr[stderr.len().saturating_sub(500)..]
+        ));
     }
     let snark_proof_path = format!("{snark_dir}/final_snark_proof.bin");
     if !std::path::Path::new(&snark_proof_path).exists() {
         return Err("final_snark_proof.bin not generated".into());
     }
-    tracing::info!(batch_number, "SNARK wrapping done");
 
-    // Read and parse SNARK proof
+    // Parse output
     let data = std::fs::read(&snark_proof_path).map_err(|e| format!("read SNARK: {e}"))?;
     let proof_len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     if proof_len != 768 {
@@ -476,13 +361,13 @@ fn generate_zisk_snark_proof(
     let pv_offset = 8 + 768;
     let pv_len = u64::from_le_bytes(data[pv_offset..pv_offset + 8].try_into().unwrap()) as usize;
     if pv_len != 256 {
-        return Err(format!("unexpected public values length: {pv_len}, expected 256"));
+        return Err(format!(
+            "unexpected public values length: {pv_len}, expected 256"
+        ));
     }
     let public_values = data[pv_offset + 8..pv_offset + 8 + 256].to_vec();
 
-    // Keep work directory for debugging
-    tracing::info!(batch_number, work_dir, "ZiSK proof files preserved for debugging");
-
+    tracing::info!(batch_number, work_dir, "ZiSK SNARK proof generated");
     Ok((snark_proof_bytes, public_values))
 }
 

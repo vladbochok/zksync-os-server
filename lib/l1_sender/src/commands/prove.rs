@@ -148,7 +148,7 @@ impl ProofCommand {
             Some(6) => 6,
             // For multi-proof system, the verifier version is carried alongside.
             // MULTI_PROOF_TYPE (5) tells the MultiProofVerifier to verify both proofs.
-            Some(v) if matches!(self.proof, SnarkProof::TwoProofSystem(_)) => v,
+            Some(v) if matches!(self.proof, SnarkProof::MultiProof(_)) => v,
             Some(execution_version) => panic!(
                 "unsupported or old execution version: {execution_version}; there's no verifier defined for it"
             ),
@@ -193,17 +193,17 @@ impl ProofCommand {
                 .chain(proof)
                 .collect()
             }
-            SnarkProof::TwoProofSystem(two_proof) => {
+            SnarkProof::MultiProof(multi_proof) => {
                 // Cross-proof validation: verify ZiSK commitment matches Era public input.
                 // ZiSK public values first 32 bytes = batch commitment (full keccak256).
                 // Era public input = batch commitment >> 32.
                 // These must match for the proofs to be for the same batch.
                 assert!(
-                    two_proof.zisk_public_values.len() == 256,
+                    multi_proof.zisk_public_values.len() == 256,
                     "ZiSK public values must be exactly 256 bytes"
                 );
                 let zisk_commitment =
-                    B256::from_slice(&two_proof.zisk_public_values[..32]);
+                    B256::from_slice(&multi_proof.zisk_public_values[..32]);
 
                 // For a single batch, public_input = get_batch_public_input(prev, batch)
                 // For multiple batches, it's a chained hash. In both cases, the ZiSK
@@ -225,7 +225,7 @@ impl ProofCommand {
                 }
 
                 // Era (Airbender) SNARK proof as U256 chunks
-                let era_chunks: Vec<U256> = two_proof
+                let era_chunks: Vec<U256> = multi_proof
                     .era_proof
                     .chunks(32)
                     .map(|chunk| {
@@ -237,7 +237,7 @@ impl ProofCommand {
                     .collect();
 
                 // ZiSK SNARK proof as U256 chunks (always 24 elements = 768 bytes)
-                let zisk_proof_chunks: Vec<U256> = two_proof
+                let zisk_proof_chunks: Vec<U256> = multi_proof
                     .zisk_proof
                     .chunks(32)
                     .map(|chunk| {
@@ -249,7 +249,7 @@ impl ProofCommand {
                     .collect();
 
                 // ZiSK public values as U256 chunks (always 8 elements = 256 bytes)
-                let zisk_pv_chunks: Vec<U256> = two_proof
+                let zisk_pv_chunks: Vec<U256> = multi_proof
                     .zisk_public_values
                     .chunks(32)
                     .map(|chunk| {
@@ -302,17 +302,17 @@ impl ProofCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batcher_model::TwoProofSystemSnarkProof;
+    use crate::batcher_model::MultiProofSnarkProof;
 
     #[test]
-    fn test_two_proof_system_serde_roundtrip() {
-        let two_proof = TwoProofSystemSnarkProof {
+    fn test_multi_proof_serde_roundtrip() {
+        let multi_proof = MultiProofSnarkProof {
             era_proof: vec![0xAB; 64],
             zisk_proof: vec![0xCD; 768],
             zisk_public_values: vec![0xEF; 256],
             proving_execution_version: 6,
         };
-        let snark = SnarkProof::TwoProofSystem(two_proof);
+        let snark = SnarkProof::MultiProof(multi_proof);
         let json = serde_json::to_string(&snark).unwrap();
         let decoded: SnarkProof = serde_json::from_str(&json).unwrap();
 
@@ -321,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn test_two_proof_system_proving_version() {
-        let snark = SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
+    fn test_multi_proof_proving_version() {
+        let snark = SnarkProof::MultiProof(MultiProofSnarkProof {
             era_proof: vec![],
             zisk_proof: vec![],
             zisk_public_values: vec![],
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(snark.proving_execution_version(), Some(6));
 
         // era_proof is returned from proof()
-        let snark2 = SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
+        let snark2 = SnarkProof::MultiProof(MultiProofSnarkProof {
             era_proof: vec![1, 2, 3],
             zisk_proof: vec![4, 5, 6],
             zisk_public_values: vec![7, 8, 9],

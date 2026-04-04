@@ -17,7 +17,7 @@ use crate::prover_api::{
         AppState,
         v1::models::{
             BatchDataPayload, FailedProofResponse, FriProofPayload, NextSnarkProverJobPayload,
-            ProverQuery, SnarkProofPayload, TwoProofSystemPayload, ZiskBatchDataPayload,
+            ProverQuery, SnarkProofPayload, ZiskBatchDataPayload,
         },
     },
 };
@@ -367,64 +367,6 @@ pub(super) async fn peek_zisk_data(
             StatusCode::NO_CONTENT.into_response()
         }
     }
-}
-
-/// Submit a two-proof-system proof (Era SNARK + ZiSK SNARK combined).
-pub(super) async fn submit_two_proof_system(
-    Query(query): Query<ProverQuery>,
-    State(state): State<AppState>,
-    Json(payload): Json<TwoProofSystemPayload>,
-) -> Result<Response, (StatusCode, String)> {
-    let start = Instant::now();
-    tracing::debug!(
-        "Received two-proof-system submit from prover with ID: {}",
-        query.id
-    );
-
-    let era_proof = general_purpose::STANDARD
-        .decode(&payload.era_proof)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid era_proof base64: {e}")))?;
-    let zisk_proof = general_purpose::STANDARD
-        .decode(&payload.zisk_proof)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid zisk_proof base64: {e}")))?;
-    let zisk_public_values = general_purpose::STANDARD
-        .decode(&payload.zisk_public_values)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid zisk_public_values base64: {e}"),
-            )
-        })?;
-
-    let proving_version = ProvingVersion::try_from_vk_hash(&payload.vk_hash).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("no Proving Version matches the provided verification key: {e}"),
-        )
-    })?;
-
-    let result = match state
-        .snark_job_manager
-        .submit_two_proof_system(
-            payload.from_batch_number,
-            payload.to_batch_number,
-            proving_version,
-            era_proof,
-            zisk_proof,
-            zisk_public_values,
-            query.id,
-        )
-        .await
-    {
-        Ok(()) => Ok((StatusCode::NO_CONTENT, "two-proof-system proof accepted".to_string())
-            .into_response()),
-        Err(err) => Err((
-            StatusCode::BAD_REQUEST,
-            format!("two-proof-system proof rejected: {err}"),
-        )),
-    };
-    PROVER_API_METRICS.submit_proof_latency[&ProverStage::Snark].observe(start.elapsed());
-    result
 }
 
 /// Get detailed information about a failed FRI proof for debugging.

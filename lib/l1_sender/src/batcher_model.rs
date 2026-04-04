@@ -290,13 +290,13 @@ pub enum SnarkProof {
     // Fake proof for testing purposes
     Fake,
     Real(RealSnarkProof),
-    /// Two-proof system: Era SNARK + ZiSK SNARK verified together on-chain.
-    TwoProofSystem(TwoProofSystemSnarkProof),
+    /// Multi-proof: Airbender SNARK + ZiSK SNARK verified together on-chain.
+    MultiProof(MultiProofSnarkProof),
 }
 
-/// Combined proof for the two-proof system (Era + ZiSK).
+/// Combined proof for the multi-proof system (Airbender + ZiSK).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TwoProofSystemSnarkProof {
+pub struct MultiProofSnarkProof {
     /// Era (airbender) SNARK proof bytes.
     pub era_proof: Vec<u8>,
     /// ZiSK SNARK proof bytes (768 bytes = 24 uint256s).
@@ -325,7 +325,7 @@ impl SnarkProof {
                 proving_execution_version,
                 ..
             }) => Some(*proving_execution_version),
-            SnarkProof::TwoProofSystem(two) => Some(two.proving_execution_version),
+            SnarkProof::MultiProof(two) => Some(two.proving_execution_version),
             _ => None,
         }
     }
@@ -333,7 +333,7 @@ impl SnarkProof {
     pub fn proof(&self) -> Option<&[u8]> {
         match self {
             SnarkProof::Real(real) => Some(real.proof()),
-            SnarkProof::TwoProofSystem(two) => Some(&two.era_proof),
+            SnarkProof::MultiProof(two) => Some(&two.era_proof),
             SnarkProof::Fake => None,
         }
     }
