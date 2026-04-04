@@ -86,45 +86,88 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         &all_preimages,
     );
 
-    let (accounts_map, mut bytecodes_map, mut bytecodes_out) =
+    let (mut accounts_map, mut bytecodes_map, mut bytecodes_out) =
         load_accounts_and_bytecodes(&initial_addrs, &mut state_with_preimages, block_output, replay_record);
 
-    let storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
+    let mut storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
 
-    let (storage_read_keys, extra_addrs, storage_reads) = pre_execute_for_reads(
-        ctx, spec_id, basefee, prev_randao, &transactions, block_output,
-        &accounts_map, &storage_prestate, &bytecodes_map,
-        state_view,
-    );
-
-    // Phase 1b: load any newly-discovered accounts (e.g. from CREATE calls)
+    // Iterative pre-execution: run REVM to discover storage reads and accounts,
+    // load them, then re-run until stable. This handles deep call chains where
+    // each level reads new storage/accounts (e.g. proxy → implementation → system contracts).
     let mut all_addrs = initial_addrs;
     let mut seen_addrs: HashSet<Address> = all_addrs.iter().copied().collect();
-    let mut state_view = read_state.state_view_at(block_number - 1)?;
+    let mut all_storage_read_keys = HashSet::new();
+    let mut all_storage_reads: Vec<(Address, U256, U256)> = Vec::new();
+    let max_iterations = 5;
 
-    for addr in extra_addrs {
-        if seen_addrs.insert(addr) {
-            all_addrs.push(addr);
-            if let Some(props) = state_view.get_account(addr) {
-                let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
-                let observable_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
-                if !preimage_hash.is_zero() && !observable_hash.is_zero() {
-                    if let Some(padded_code) = state_view.get_preimage(preimage_hash) {
-                        let raw_len = props.unpadded_code_len as usize;
-                        let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
-                            &padded_code[..raw_len]
-                        } else {
-                            &padded_code[..]
-                        };
-                        if !bytecodes_map.contains_key(&observable_hash) {
-                            bytecodes_out.push((observable_hash, raw_code.to_vec()));
-                            bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
+    for iteration in 0..max_iterations {
+        let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
+        let (read_keys, extra_addrs, storage_reads) = pre_execute_for_reads(
+            ctx, spec_id, basefee, prev_randao, &transactions, block_output,
+            &accounts_map, &storage_prestate, &bytecodes_map,
+            state_view_for_pre,
+        );
+
+        let new_keys = read_keys.difference(&all_storage_read_keys).count();
+        all_storage_read_keys.extend(read_keys);
+
+        // Merge new storage reads into prestate so next iteration has them
+        let mut new_reads = 0;
+        for (addr, slot, val) in &storage_reads {
+            if storage_prestate.insert((*addr, *slot), *val).is_none() {
+                new_reads += 1;
+            }
+        }
+        all_storage_reads.extend(storage_reads);
+
+        // Load newly discovered accounts
+        let mut state_view_reload = read_state.state_view_at(block_number - 1)?;
+        let mut new_accounts = 0;
+        for addr in extra_addrs {
+            if seen_addrs.insert(addr) {
+                all_addrs.push(addr);
+                new_accounts += 1;
+                if let Some(props) = state_view_reload.get_account(addr) {
+                    let preimage_hash = B256::from(props.bytecode_hash.as_u8_array());
+                    let observable_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+                    let effective = if observable_hash.is_zero() {
+                        if props.nonce == 0 && props.balance == U256::ZERO { B256::ZERO } else { KECCAK_EMPTY }
+                    } else { observable_hash };
+                    accounts_map.insert(addr, AccountInfo {
+                        nonce: props.nonce, balance: props.balance, code_hash: effective,
+                        code: None, account_id: None,
+                    });
+                    if !preimage_hash.is_zero() && !observable_hash.is_zero() {
+                        if let Some(padded_code) = state_view_reload.get_preimage(preimage_hash) {
+                            let raw_len = props.unpadded_code_len as usize;
+                            let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
+                                &padded_code[..raw_len]
+                            } else {
+                                &padded_code[..]
+                            };
+                            if !bytecodes_map.contains_key(&observable_hash) {
+                                bytecodes_out.push((observable_hash, raw_code.to_vec()));
+                                bytecodes_map.insert(observable_hash, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
+                            }
                         }
                     }
                 }
             }
         }
+
+        tracing::debug!(
+            iteration, new_keys, new_reads, new_accounts,
+            "Pre-execution iteration"
+        );
+
+        // Stable if no new state discovered
+        if new_keys == 0 && new_reads == 0 && new_accounts == 0 {
+            break;
+        }
     }
+    let mut state_view = read_state.state_view_at(block_number - 1)?;
+    let storage_read_keys = all_storage_read_keys;
+    let storage_reads = all_storage_reads;
 
     // Phase 2: extract merkle proofs for all accessed keys
     let (accounts_out, account_preimages, mut storage_proofs) =
