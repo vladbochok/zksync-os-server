@@ -12,8 +12,7 @@ use zksync_os_contract_interface::models::StoredBatchInfo;
 const OHBENDER_PROOF_TYPE: u32 = 2;
 const FAKE_PROOF_TYPE: u32 = 3;
 const FAKE_PROOF_MAGIC_VALUE: u32 = 13;
-#[cfg(test)]
-const TWO_PROOF_SYSTEM_TYPE: u32 = 4;
+const MULTI_PROOF_TYPE: u32 = 5;
 
 #[derive(Debug)]
 pub struct ProofCommand {
@@ -147,9 +146,8 @@ impl ProofCommand {
             Some(4) => 4,
             Some(5) => 5,
             Some(6) => 6,
-            // For two-proof system, the Era verifier version is carried alongside.
-            // The proof type field (TWO_PROOF_SYSTEM_TYPE) tells the L1 executor
-            // to route to the TwoProofSystemVerifier contract.
+            // For multi-proof system, the verifier version is carried alongside.
+            // MULTI_PROOF_TYPE (5) tells the MultiProofVerifier to verify both proofs.
             Some(v) if matches!(self.proof, SnarkProof::TwoProofSystem(_)) => v,
             Some(execution_version) => panic!(
                 "unsupported or old execution version: {execution_version}; there's no verifier defined for it"
@@ -226,6 +224,18 @@ impl ProofCommand {
                     );
                 }
 
+                // Era (Airbender) SNARK proof as U256 chunks
+                let era_chunks: Vec<U256> = two_proof
+                    .era_proof
+                    .chunks(32)
+                    .map(|chunk| {
+                        let arr: [u8; 32] = chunk
+                            .try_into()
+                            .expect("era proof bytes must be a multiple of 32");
+                        U256::from_be_bytes(arr)
+                    })
+                    .collect();
+
                 // ZiSK SNARK proof as U256 chunks (always 24 elements = 768 bytes)
                 let zisk_proof_chunks: Vec<U256> = two_proof
                     .zisk_proof
@@ -250,28 +260,23 @@ impl ProofCommand {
                     })
                     .collect();
 
-                // Encoding: type 2 (OHBENDER) for Executor compatibility.
-                // The Executor passes proof[2..] to verifier.verify().
-                // We put the ZiSK proof directly as proof[2..] so the verifier
-                // receives it as _proof[] and can verify it.
+                // Multi-proof encoding (MULTI_PROOF_TYPE = 5).
+                // The MultiProofVerifier requires BOTH proofs to pass.
                 // Layout:
-                // [0] = OHBENDER_PROOF_TYPE | (verifier_version << 8)
+                // [0] = MULTI_PROOF_TYPE | (verifier_version << 8)
                 // [1] = 0 (previous hash)
-                // [2..26] = ZiSK SNARK proof (24 uint256s)
-                // [26..34] = ZiSK public values (8 uint256s)
-                // Pad to 44 elements (standard ohbender SNARK size) so the Executor's
-                // internal format validation accepts it. The extra 12 zero elements are
-                // ignored by our ZiskL1Verifier.
+                // [2] = N (number of Airbender proof elements)
+                // [3 .. 3+N] = Airbender SNARK proof elements
+                // [3+N .. 3+N+24] = ZiSK SNARK proof (24 uint256s)
+                // [3+N+24 .. 3+N+32] = ZiSK public values (8 uint256s)
                 let mut proof_vec = vec![
-                    U256::from(OHBENDER_PROOF_TYPE | (verifier_version << 8)),
-                    U256::from(0),
+                    U256::from(MULTI_PROOF_TYPE | (verifier_version << 8)),
+                    U256::from(0),                    // previous hash
+                    U256::from(era_chunks.len()),      // N
                 ];
-                proof_vec.extend(zisk_proof_chunks);  // 24 elements
-                proof_vec.extend(zisk_pv_chunks);      // 8 elements = 32 total
-                // Pad to 44 data elements (standard ohbender proof size)
-                while proof_vec.len() < 46 {  // 2 header + 44 data
-                    proof_vec.push(U256::ZERO);
-                }
+                proof_vec.extend(era_chunks);          // Airbender proof
+                proof_vec.extend(zisk_proof_chunks);   // ZiSK SNARK (24)
+                proof_vec.extend(zisk_pv_chunks);      // ZiSK public values (8)
                 proof_vec
             }
         };
@@ -353,20 +358,20 @@ mod tests {
     }
 
     #[test]
-    fn test_two_proof_type_constant() {
-        // TWO_PROOF_SYSTEM_TYPE must be distinct from existing types
-        assert_ne!(TWO_PROOF_SYSTEM_TYPE, OHBENDER_PROOF_TYPE);
-        assert_ne!(TWO_PROOF_SYSTEM_TYPE, FAKE_PROOF_TYPE);
-        assert_eq!(TWO_PROOF_SYSTEM_TYPE, 4);
+    fn test_multi_proof_type_constant() {
+        // MULTI_PROOF_TYPE must be distinct from existing types
+        assert_ne!(MULTI_PROOF_TYPE, OHBENDER_PROOF_TYPE);
+        assert_ne!(MULTI_PROOF_TYPE, FAKE_PROOF_TYPE);
+        assert_eq!(MULTI_PROOF_TYPE, 5);
     }
 
     #[test]
-    fn test_two_proof_encoding_type_field() {
+    fn test_multi_proof_encoding_type_field() {
         // Verify the proof type encoding formula
         let verifier_version: u32 = 6;
-        let encoded = TWO_PROOF_SYSTEM_TYPE | (verifier_version << 8);
+        let encoded = MULTI_PROOF_TYPE | (verifier_version << 8);
         // Type is in low byte
-        assert_eq!(encoded & 0xFF, TWO_PROOF_SYSTEM_TYPE);
+        assert_eq!(encoded & 0xFF, MULTI_PROOF_TYPE);
         // Version is in higher bytes
         assert_eq!(encoded >> 8, verifier_version);
     }

@@ -1176,10 +1176,14 @@ impl AnvilL1 {
     }
 }
 
-/// Deploy ZiskVerifier via standard contract deployment and register it in the DualVerifier.
+/// Deploy MultiProofVerifier and set it as the chain's verifier.
 ///
-/// Discovers the current verifier (DualVerifier) from L1 contracts, deploys the ZiskVerifier
-/// contract via a real CREATE transaction, then registers it via `addVerifier(version)`.
+/// 1. Discovers the current DualVerifier and its inner Airbender plonk verifier
+/// 2. Deploys ZiskVerifier (inner ZiSK proof verifier)
+/// 3. Deploys MultiProofVerifier(airbenderVerifier, ziskVerifier, owner)
+/// 4. Updates the diamond proxy's `s.verifier` storage to point to MultiProofVerifier
+///
+/// After this, the chain requires BOTH Airbender and ZiSK proofs for every state transition.
 async fn deploy_zisk_l1_verifier(
     l1_provider: &EthDynProvider,
     l1_rpc_url: &str,
@@ -1187,6 +1191,7 @@ async fn deploy_zisk_l1_verifier(
     chain_id: u64,
 ) {
     use alloy::network::TransactionBuilder;
+    use alloy::primitives::B256;
     use zksync_os_contract_interface::l1_discovery::L1State;
 
     alloy::sol! {
@@ -1197,12 +1202,12 @@ async fn deploy_zisk_l1_verifier(
 
         #[sol(rpc)]
         contract IDualVerifier {
-            function addVerifier(uint32 version, address _fflonkVerifier, address _plonkVerifier) external;
+            function plonkVerifiers(uint32 version) external view returns (address);
             function owner() external view returns (address);
         }
     }
 
-    // Fetch L1 state to discover the verifier address.
+    // Fetch L1 state to discover contract addresses.
     let l1_state = match L1State::fetch(
         DynProvider::new(l1_provider.clone()),
         None,
@@ -1213,12 +1218,11 @@ async fn deploy_zisk_l1_verifier(
     {
         Ok(state) => state,
         Err(e) => {
-            tracing::warn!("Could not fetch L1 state for ZiSK verifier deployment: {e:#}");
+            tracing::warn!("Could not fetch L1 state for multi-proof verifier deployment: {e:#}");
             return;
         }
     };
 
-    // Query the diamond proxy for the current DualVerifier address.
     let diamond_proxy_addr = l1_state.diamond_proxy_address_sl();
     let getters = IGettersFacet::new(diamond_proxy_addr, DynProvider::new(l1_provider.clone()));
     let dual_verifier_addr: Address = match getters.getVerifier().call().await {
@@ -1229,38 +1233,18 @@ async fn deploy_zisk_l1_verifier(
         }
     };
 
-    // Load the ZiskVerifier artifact (compiled from era-contracts).
-    let artifact_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../era-contracts/l1-contracts/out/ZiskVerifier.sol/ZiskVerifier.json");
-    let creation_bytecode = if artifact_path.exists() {
-        let artifact_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&artifact_path).expect("read ZiskVerifier artifact"),
-        )
-        .expect("parse ZiskVerifier artifact");
-        match artifact_json["bytecode"]["object"].as_str() {
-            Some(hex_str) => {
-                let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-                alloy::primitives::Bytes::from(
-                    alloy::primitives::hex::decode(raw).expect("decode ZiskVerifier bytecode"),
-                )
-            }
-            None => {
-                tracing::warn!("ZiskVerifier artifact has no bytecode.object");
-                return;
-            }
-        }
-    } else {
-        tracing::warn!(
-            "ZiskVerifier artifact not found at {}; skipping ZiSK verifier deployment",
-            artifact_path.display()
-        );
-        return;
-    };
-
-    // Deploy ZiskVerifier via a standard CREATE transaction.
-    // Use the DualVerifier's owner to send the deployment + addVerifier transactions.
+    // Get the existing Airbender plonk verifier (version 0) from the DualVerifier.
     let dual_verifier =
         IDualVerifier::new(dual_verifier_addr, DynProvider::new(l1_provider.clone()));
+    let airbender_verifier_addr = match dual_verifier.plonkVerifiers(0).call().await {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::warn!("Could not query plonkVerifiers(0): {e:#}");
+            return;
+        }
+    };
+    tracing::info!("Airbender verifier at {airbender_verifier_addr}");
+
     let owner_addr = match dual_verifier.owner().call().await {
         Ok(addr) => addr,
         Err(e) => {
@@ -1269,54 +1253,117 @@ async fn deploy_zisk_l1_verifier(
         }
     };
 
-    // Impersonate the DualVerifier owner on Anvil to send transactions.
+    // Helper: load artifact creation bytecode from forge output.
+    let load_artifact = |name: &str| -> Option<alloy::primitives::Bytes> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../era-contracts/l1-contracts/out/{name}.sol/{name}.json"));
+        if !path.exists() {
+            tracing::warn!("{name} artifact not found at {}", path.display());
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        let hex_str = json["bytecode"]["object"].as_str()?;
+        let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+        Some(alloy::primitives::Bytes::from(
+            alloy::primitives::hex::decode(raw).unwrap_or_else(|e| panic!("decode {name}: {e}")),
+        ))
+    };
+
+    let zisk_bytecode = match load_artifact("ZiskVerifier") {
+        Some(b) => b,
+        None => return,
+    };
+    let multi_proof_bytecode = match load_artifact("MultiProofVerifier") {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Impersonate owner for deployment transactions.
     l1_provider
         .client()
         .request::<_, ()>("anvil_impersonateAccount", (owner_addr,))
         .await
-        .expect("failed to impersonate DualVerifier owner");
+        .expect("anvil_impersonateAccount failed");
 
-    // Deploy the ZiskVerifier contract via eth_sendTransaction (impersonated, no signing needed).
-    // Use a plain provider (no wallet filler) to avoid the "missing to" error on contract creation.
+    // Plain provider (no wallet filler) for impersonated transactions.
     let raw_provider: DynProvider = ProviderBuilder::new()
         .connect(l1_rpc_url)
         .await
         .expect("failed to create raw L1 provider")
         .erased();
-    let deploy_tx = TransactionRequest::default()
-        .from(owner_addr)
-        .with_input(creation_bytecode);
-    let deploy_receipt = raw_provider
-        .send_transaction(deploy_tx)
+
+    // Deploy ZiskVerifier.
+    let zisk_receipt = raw_provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(owner_addr)
+                .with_input(zisk_bytecode),
+        )
         .await
-        .expect("failed to send ZiskVerifier deploy tx")
+        .expect("ZiskVerifier deploy tx send failed")
         .with_required_confirmations(1)
         .get_receipt()
         .await
         .expect("ZiskVerifier deploy tx failed");
-    let zisk_verifier_addr = deploy_receipt
+    let zisk_verifier_addr = zisk_receipt
         .contract_address
-        .expect("ZiskVerifier deploy tx has no contract address");
+        .expect("ZiskVerifier has no contract address");
     tracing::info!("Deployed ZiskVerifier at {zisk_verifier_addr}");
 
-    // Register the ZiskVerifier in the DualVerifier as a plonk verifier.
-    // Use version 0 so it handles proof type 2 with verifier_version=0 (default).
-    // The addVerifier call replaces the existing plonk verifier at version 0.
-    let dual_verifier_raw =
-        IDualVerifier::new(dual_verifier_addr, raw_provider.clone());
-    let add_tx = dual_verifier_raw
-        .addVerifier(0, Address::ZERO, zisk_verifier_addr)
-        .from(owner_addr);
-    add_tx
-        .send()
+    // Deploy MultiProofVerifier(airbenderVerifier, ziskVerifier, owner).
+    // Constructor ABI: (address, address, address)
+    let constructor_args = alloy::sol_types::SolValue::abi_encode(&(
+        airbender_verifier_addr,
+        zisk_verifier_addr,
+        owner_addr,
+    ));
+    let mut deploy_data = multi_proof_bytecode.to_vec();
+    deploy_data.extend_from_slice(&constructor_args);
+    let multi_receipt = raw_provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(owner_addr)
+                .with_input(alloy::primitives::Bytes::from(deploy_data)),
+        )
         .await
-        .expect("failed to send addVerifier tx")
+        .expect("MultiProofVerifier deploy tx send failed")
         .with_required_confirmations(1)
         .get_receipt()
         .await
-        .expect("addVerifier tx failed");
+        .expect("MultiProofVerifier deploy tx failed");
+    let multi_proof_addr = multi_receipt
+        .contract_address
+        .expect("MultiProofVerifier has no contract address");
+    tracing::info!("Deployed MultiProofVerifier at {multi_proof_addr}");
+
+    // Update the diamond proxy's s.verifier storage slot to point to MultiProofVerifier.
+    // In ZKChainStorage: verifier is at slot 10 (after 7 deprecated uint256 + 2 addresses + 1 mapping).
+    let verifier_slot = B256::from(U256::from(10).to_be_bytes::<32>());
+    let verifier_value = B256::left_padding_from(multi_proof_addr.as_slice());
+    let _: bool = l1_provider
+        .client()
+        .request(
+            "anvil_setStorageAt",
+            (diamond_proxy_addr, verifier_slot, verifier_value),
+        )
+        .await
+        .expect("anvil_setStorageAt for s.verifier failed");
+
+    // Verify the update.
+    let new_verifier: Address = getters
+        .getVerifier()
+        .call()
+        .await
+        .expect("getVerifier after update failed");
+    assert_eq!(
+        new_verifier, multi_proof_addr,
+        "verifier address not updated correctly"
+    );
     tracing::info!(
-        "Registered ZiskVerifier at version 0 in DualVerifier {dual_verifier_addr}"
+        "Diamond proxy verifier updated: {dual_verifier_addr} → {multi_proof_addr} (MultiProofVerifier)"
     );
 
     // Stop impersonation.
@@ -1324,7 +1371,7 @@ async fn deploy_zisk_l1_verifier(
         .client()
         .request::<_, ()>("anvil_stopImpersonatingAccount", (owner_addr,))
         .await
-        .expect("failed to stop impersonation");
+        .expect("anvil_stopImpersonatingAccount failed");
 }
 
 #[cfg(feature = "prover-tests")]
