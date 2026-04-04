@@ -172,65 +172,58 @@ impl SnarkJobManager {
     /// Process one pending multi-proof: generate ZiSK SNARK and combine.
     /// Called by the MultiProofCombiner background task.
     async fn process_one_pending_multi_proof(&self) -> anyhow::Result<bool> {
-        // Take the first pending batch.
-        let (batch_num, pending) = {
-            let mut map = self.pending_multi_proofs.lock().await;
+        // Peek at the first pending batch without removing it.
+        let batch_num = {
+            let map = self.pending_multi_proofs.lock().await;
             match map.keys().next().copied() {
-                Some(k) => (k, map.remove(&k).unwrap()),
+                Some(k) => k,
                 None => return Ok(false),
             }
         };
 
-        // Take ZiSK data from the FRI job manager.
-        let zisk_data = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.take_zisk_data(batch_num).await
+        // Clone ZiSK data (don't remove — we may need to retry on failure).
+        let zisk_bincode = if let Some(ref fjm) = self.fri_job_manager {
+            fjm.clone_zisk_data(batch_num).await
         } else {
             None
         };
 
-        let snark_proof = if let Some(zisk_bincode) = zisk_data {
-            tracing::info!(
-                batch = batch_num,
-                zisk_input_bytes = zisk_bincode.len(),
-                "Generating ZiSK SNARK for multi-proof"
-            );
-            let zisk_result = tokio::task::spawn_blocking(move || {
-                generate_zisk_snark_proof(&zisk_bincode, batch_num)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("ZiSK spawn_blocking: {e}"))?;
-
-            match zisk_result {
-                Ok((zisk_proof, zisk_public_values)) => {
-                    tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
-                    SnarkProof::MultiProof(MultiProofSnarkProof {
-                        era_proof: pending.era_proof,
-                        zisk_proof,
-                        zisk_public_values,
-                        proving_execution_version: pending.proving_version,
-                    })
-                }
-                Err(e) => {
-                    tracing::error!(
-                        batch = batch_num,
-                        "ZiSK SNARK failed: {e}, falling back to Airbender-only"
-                    );
-                    SnarkProof::Real(RealSnarkProof::V2 {
-                        proof: pending.era_proof,
-                        proving_execution_version: pending.proving_version,
-                    })
-                }
-            }
-        } else {
-            tracing::warn!(
-                batch = batch_num,
-                "ZiSK data disappeared, falling back to Airbender-only"
-            );
-            SnarkProof::Real(RealSnarkProof::V2 {
-                proof: pending.era_proof,
-                proving_execution_version: pending.proving_version,
-            })
+        let Some(zisk_bincode) = zisk_bincode else {
+            anyhow::bail!("ZiSK data missing for batch {batch_num} — cannot produce multi-proof");
         };
+
+        tracing::info!(
+            batch = batch_num,
+            zisk_input_bytes = zisk_bincode.len(),
+            "Generating ZiSK SNARK for multi-proof"
+        );
+        let zisk_result = tokio::task::spawn_blocking(move || {
+            generate_zisk_snark_proof(&zisk_bincode, batch_num)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("ZiSK spawn_blocking: {e}"))?;
+
+        let (zisk_proof, zisk_public_values) = zisk_result
+            .map_err(|e| anyhow::anyhow!("ZiSK SNARK failed for batch {batch_num}: {e}"))?;
+
+        // ZiSK SNARK succeeded — remove both the pending proof and ZiSK data.
+        let pending = self
+            .pending_multi_proofs
+            .lock()
+            .await
+            .remove(&batch_num)
+            .expect("pending multi-proof disappeared");
+        if let Some(ref fjm) = self.fri_job_manager {
+            fjm.take_zisk_data(batch_num).await;
+        }
+
+        tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
+        let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
+            era_proof: pending.era_proof,
+            zisk_proof,
+            zisk_public_values,
+            proving_execution_version: pending.proving_version,
+        });
 
         self.send_downstream(ProofCommand::new(pending.batches, snark_proof))
             .await?;
@@ -467,8 +460,8 @@ impl MultiProofCombiner {
                     tokio::time::sleep(self.polling_interval).await;
                 }
                 Err(e) => {
-                    tracing::error!("MultiProofCombiner error (will retry): {e:#}");
-                    tokio::time::sleep(self.polling_interval).await;
+                    tracing::error!("MultiProofCombiner error (will retry in 60s): {e:#}");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             }
         }
