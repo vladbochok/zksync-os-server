@@ -883,6 +883,12 @@ pub struct ProverInputGeneratorConfig {
     /// The two proofs run in parallel — the primary is always airbender.
     #[config(default_t = false)]
     pub second_proof_system: bool,
+
+    /// When true, deploy and use the MultiProofVerifier on L1 which requires
+    /// BOTH Airbender and ZiSK proofs for every state transition.
+    /// Implies `second_proof_system = true`.
+    #[config(default_t = false)]
+    pub multi_proof_verifier: bool,
 }
 
 /// Only used on the Main Node.

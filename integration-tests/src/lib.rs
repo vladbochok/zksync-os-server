@@ -448,6 +448,7 @@ impl Tester {
                 logging_enabled: enable_prover,
                 enable_input_generation: enable_prover_input_generation,
                 second_proof_system: enable_prover_input_generation,
+                multi_proof_verifier: enable_prover_input_generation,
                 ..default_config.prover_input_generator_config
             },
             prover_api_config,
@@ -484,12 +485,15 @@ impl Tester {
             node = %log_tag,
             role = %node_role,
         );
-        // Deploy ZiskVerifier via standard contract deployment and register it in the DualVerifier.
-        if let (Some(bridgehub_addr), Some(chain_id)) = (
-            config.genesis_config.bridgehub_address,
-            config.genesis_config.chain_id,
-        ) {
-            deploy_zisk_l1_verifier(&l1.provider, &l1.address, bridgehub_addr, chain_id).await;
+        // Deploy MultiProofVerifier if multi_proof_verifier is enabled.
+        if config.prover_input_generator_config.multi_proof_verifier {
+            if let (Some(bridgehub_addr), Some(chain_id)) = (
+                config.genesis_config.bridgehub_address,
+                config.genesis_config.chain_id,
+            ) {
+                deploy_multi_proof_verifier(&l1.provider, &l1.address, bridgehub_addr, chain_id)
+                    .await;
+            }
         }
 
         tracing::info!(parent: &node_span, "Launching test node");
@@ -1184,7 +1188,7 @@ impl AnvilL1 {
 /// 4. Updates the diamond proxy's `s.verifier` storage to point to MultiProofVerifier
 ///
 /// After this, the chain requires BOTH Airbender and ZiSK proofs for every state transition.
-async fn deploy_zisk_l1_verifier(
+async fn deploy_multi_proof_verifier(
     l1_provider: &EthDynProvider,
     l1_rpc_url: &str,
     bridgehub_addr: Address,
