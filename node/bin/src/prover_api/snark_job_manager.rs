@@ -1,9 +1,11 @@
 use crate::prover_api::fri_job_manager::{FriJob, FriJobManager};
 use crate::prover_api::metrics::{ProverStage, ProverType};
 use crate::prover_api::prover_job_map::ProverJobMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Mutex;
 use zksync_os_l1_sender::batcher_metrics::BatchExecutionStage;
 use zksync_os_l1_sender::batcher_model::{
     FriProof, MultiProofSnarkProof, RealSnarkProof, SignedBatchEnvelope, SnarkProof,
@@ -14,37 +16,31 @@ use zksync_os_observability::{
 };
 use zksync_os_types::ProvingVersion;
 
+/// Cached Airbender SNARK proof waiting for ZiSK SNARK to be generated.
+struct PendingMultiProof {
+    era_proof: Vec<u8>,
+    proving_version: u32,
+    batches: Vec<SignedBatchEnvelope<FriProof>>,
+}
+
 /// Job manager for SNARK proving.
 ///
-/// Supports multiple SNARK provers
-///
-/// Supports both real and fake proofs.
-///  - Fake FRI proofs always result in fake SNARK proofs.
-///  - Real FRI proofs may result in real or fake SNARK proofs depending on prover availability
-///
-/// `SnarkJobManager` aims to assign real prover jobs to real SNARK provers -
-///     but if jobs are not picked within a timeout (`max_batch_age`), it releases it to a fake prover
-///
-///
-/// `ComponentStateLatencyTracker`: Only tracks `Processing` / `WaitingSend` states
+/// When an Airbender SNARK is submitted and ZiSK data exists for the batch,
+/// the proof is cached. A background task (`MultiProofCombiner`) generates
+/// the ZiSK SNARK and combines both into a MultiProof for L1 submission.
 pub struct SnarkJobManager {
-    // == state ==
     jobs: ProverJobMap<FriProof>,
-    // outbound
     prove_batches_sender: Sender<ProofCommand>,
-    // config
     max_fris_per_snark: usize,
-    /// Reference to FriJobManager for accessing cached ZiSK data.
     fri_job_manager: Option<Arc<FriJobManager>>,
-    // metrics
+    /// Airbender SNARKs waiting for ZiSK SNARK generation.
+    pending_multi_proofs: Mutex<HashMap<u64, PendingMultiProof>>,
     latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
 
 impl SnarkJobManager {
     pub fn new(
-        // outbound
         prove_batches_sender: Sender<ProofCommand>,
-        // config
         max_fris_per_snark: usize,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
@@ -63,27 +59,23 @@ impl SnarkJobManager {
             prove_batches_sender,
             max_fris_per_snark,
             fri_job_manager: None,
+            pending_multi_proofs: Mutex::new(HashMap::new()),
             latency_tracker,
         }
     }
 
-    /// Set the FriJobManager reference for ZiSK data access.
     pub fn set_fri_job_manager(&mut self, fjm: Arc<FriJobManager>) {
         self.fri_job_manager = Some(fjm);
     }
 
-    /// Adds a pending job to the queue.
-    /// Awaits if queue is full (ProverJobMap.max_assigned_batch_range).
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<FriProof>) {
         self.jobs.add_job(batch_envelope).await
     }
 
-    // If there is a job pending, returns a non-empty list of tuples (`batch_number`, `verification_key_hash`, `real_fri_proof`)
     pub async fn pick_real_job(
         &self,
         prover_id: String,
     ) -> anyhow::Result<Option<Vec<(FriJob, FriProof)>>> {
-        // consume/remove all fake jobs that may be in the front of the queue
         self.process_pending_fake_fri_proofs().await?;
 
         let batches_with_real_proofs = self
@@ -94,18 +86,20 @@ impl SnarkJobManager {
             .await;
 
         if batches_with_real_proofs.is_empty() {
-            tracing::trace!(prover_id, "no SNARK prove jobs are available for pick up",);
+            tracing::trace!(prover_id, "no SNARK prove jobs are available for pick up");
             return Ok(None);
         }
 
         Ok(Some(batches_with_real_proofs))
     }
 
-    /// Submit a real Airbender SNARK proof from an external prover.
+    /// Submit a real Airbender SNARK proof.
     ///
-    /// If ZiSK data is available for the batch, generates the ZiSK SNARK proof
-    /// and combines both into a MultiProof (type 5) for on-chain verification.
-    /// Otherwise, submits the Airbender proof alone (type 2).
+    /// If ZiSK data exists, the Airbender SNARK is cached for async combination.
+    /// The MultiProofCombiner background task will generate the ZiSK SNARK and
+    /// send the combined MultiProof downstream.
+    ///
+    /// If no ZiSK data exists, the Airbender proof is sent downstream immediately.
     pub async fn submit_proof(
         &self,
         batch_from: u64,
@@ -125,26 +119,81 @@ impl SnarkJobManager {
         let server_vk = consumed_batches_proven[0]
             .batch
             .verification_key_hash()
-            .expect("verification key hash must be present as it was set by server");
+            .expect("verification key hash must be present");
         let prover_vk = proving_version.vk_hash();
         anyhow::ensure!(
             server_vk == prover_vk,
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
-        // Check if ZiSK data is available — if so, generate ZiSK SNARK and combine.
+        // Check if ZiSK data exists — if so, cache for async combination.
+        let has_zisk = if let Some(ref fjm) = self.fri_job_manager {
+            fjm.peek_zisk_data(batch_from).await
+        } else {
+            false
+        };
+
+        if has_zisk {
+            tracing::info!(
+                batch = batch_from,
+                "Airbender SNARK received, queuing for ZiSK combination"
+            );
+            let batches: Vec<_> = consumed_batches_proven
+                .into_iter()
+                .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
+                .collect();
+            self.pending_multi_proofs.lock().await.insert(
+                batch_from,
+                PendingMultiProof {
+                    era_proof: payload,
+                    proving_version: proving_version as u32,
+                    batches,
+                },
+            );
+            Ok(())
+        } else {
+            // No ZiSK data — send Airbender-only proof immediately.
+            let consumed_batches_proven: Vec<_> = consumed_batches_proven
+                .into_iter()
+                .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
+                .collect();
+            self.send_downstream(ProofCommand::new(
+                consumed_batches_proven,
+                SnarkProof::Real(RealSnarkProof::V2 {
+                    proof: payload,
+                    proving_execution_version: proving_version as u32,
+                }),
+            ))
+            .await?;
+            Ok(())
+        }
+    }
+
+    /// Process one pending multi-proof: generate ZiSK SNARK and combine.
+    /// Called by the MultiProofCombiner background task.
+    async fn process_one_pending_multi_proof(&self) -> anyhow::Result<bool> {
+        // Take the first pending batch.
+        let (batch_num, pending) = {
+            let mut map = self.pending_multi_proofs.lock().await;
+            match map.keys().next().copied() {
+                Some(k) => (k, map.remove(&k).unwrap()),
+                None => return Ok(false),
+            }
+        };
+
+        // Take ZiSK data from the FRI job manager.
         let zisk_data = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.take_zisk_data(batch_from).await
+            fjm.take_zisk_data(batch_num).await
         } else {
             None
         };
 
         let snark_proof = if let Some(zisk_bincode) = zisk_data {
             tracing::info!(
-                batch = batch_from,
-                "Generating ZiSK SNARK to combine with Airbender proof"
+                batch = batch_num,
+                zisk_input_bytes = zisk_bincode.len(),
+                "Generating ZiSK SNARK for multi-proof"
             );
-            let batch_num = batch_from;
             let zisk_result = tokio::task::spawn_blocking(move || {
                 generate_zisk_snark_proof(&zisk_bincode, batch_num)
             })
@@ -153,37 +202,39 @@ impl SnarkJobManager {
 
             match zisk_result {
                 Ok((zisk_proof, zisk_public_values)) => {
-                    tracing::info!(batch = batch_from, "Combined Airbender + ZiSK multi-proof ready");
+                    tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
                     SnarkProof::MultiProof(MultiProofSnarkProof {
-                        era_proof: payload,
+                        era_proof: pending.era_proof,
                         zisk_proof,
                         zisk_public_values,
-                        proving_execution_version: proving_version as u32,
+                        proving_execution_version: pending.proving_version,
                     })
                 }
                 Err(e) => {
-                    tracing::error!(batch = batch_from, "ZiSK SNARK failed: {e}, falling back to Airbender-only");
+                    tracing::error!(
+                        batch = batch_num,
+                        "ZiSK SNARK failed: {e}, falling back to Airbender-only"
+                    );
                     SnarkProof::Real(RealSnarkProof::V2 {
-                        proof: payload,
-                        proving_execution_version: proving_version as u32,
+                        proof: pending.era_proof,
+                        proving_execution_version: pending.proving_version,
                     })
                 }
             }
         } else {
+            tracing::warn!(
+                batch = batch_num,
+                "ZiSK data disappeared, falling back to Airbender-only"
+            );
             SnarkProof::Real(RealSnarkProof::V2 {
-                proof: payload,
-                proving_execution_version: proving_version as u32,
+                proof: pending.era_proof,
+                proving_execution_version: pending.proving_version,
             })
         };
 
-        let consumed_batches_proven: Vec<_> = consumed_batches_proven
-            .into_iter()
-            .map(|batch| batch.with_stage(BatchExecutionStage::SnarkProvedReal))
-            .collect();
-
-        self.send_downstream(ProofCommand::new(consumed_batches_proven, snark_proof))
+        self.send_downstream(ProofCommand::new(pending.batches, snark_proof))
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Consumes fake FRI proofs from the head of the queue and turns them into fake SNARKs.
@@ -192,9 +243,6 @@ impl SnarkJobManager {
             .await
     }
 
-    /// Consumes FRI proofs from the head of the queue that satisfy the following conditions:
-    /// * FRI proof is fake
-    /// * if `timeout_for_real_fris` is Some, then also jobs that are older than `timeout_for_real_fris`
     async fn process_pending_fake_or_timed_out_fri_proofs(
         &self,
         timeout_for_real_fris: Option<Duration>,
@@ -259,9 +307,14 @@ const POLL_INTERVAL_MS: u64 = 1000;
 
 pub struct FakeSnarkProver {
     job_manager: Arc<SnarkJobManager>,
-
-    // config
     max_batch_age: Duration,
+    polling_interval: Duration,
+}
+
+/// Background task that generates ZiSK SNARK proofs and combines them
+/// with cached Airbender SNARKs into MultiProofs.
+pub struct MultiProofCombiner {
+    job_manager: Arc<SnarkJobManager>,
     polling_interval: Duration,
 }
 
@@ -389,6 +442,34 @@ impl FakeSnarkProver {
                 .await
             {
                 tracing::error!("FakeSnarkProver error (will retry): {e:#}");
+            }
+        }
+    }
+}
+
+impl MultiProofCombiner {
+    pub fn new(job_manager: Arc<SnarkJobManager>) -> Self {
+        Self {
+            job_manager,
+            polling_interval: Duration::from_millis(POLL_INTERVAL_MS),
+        }
+    }
+
+    pub async fn run(self) {
+        loop {
+            match self.job_manager.process_one_pending_multi_proof().await {
+                Ok(true) => {
+                    // Processed one — check for more immediately.
+                    continue;
+                }
+                Ok(false) => {
+                    // Nothing pending — sleep before polling again.
+                    tokio::time::sleep(self.polling_interval).await;
+                }
+                Err(e) => {
+                    tracing::error!("MultiProofCombiner error (will retry): {e:#}");
+                    tokio::time::sleep(self.polling_interval).await;
+                }
             }
         }
     }

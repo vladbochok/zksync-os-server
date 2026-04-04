@@ -1038,7 +1038,16 @@ async fn run_main_node_pipeline(
     }
 
     if config.prover_api_config.fake_snark_provers.enabled {
-        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager);
+        run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager.clone());
+    }
+
+    // Spawn the MultiProofCombiner to asynchronously generate ZiSK SNARK proofs
+    // and combine them with Airbender SNARKs that were cached by submit_proof().
+    if config.prover_input_generator_config.second_proof_system {
+        let combiner = crate::prover_api::snark_job_manager::MultiProofCombiner::new(
+            snark_job_manager,
+        );
+        runtime.spawn_critical_task("multi_proof_combiner", combiner.run());
     }
 
     if !config.prover_input_generator_config.enable_input_generation {

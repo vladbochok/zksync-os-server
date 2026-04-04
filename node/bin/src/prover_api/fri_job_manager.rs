@@ -143,6 +143,11 @@ impl FriJobManager {
         self.zisk_data_cache.lock().await.remove(&batch_number)
     }
 
+    /// Check whether ZiSK data exists for the given batch (without removing it).
+    pub async fn peek_zisk_data(&self, batch_number: u64) -> bool {
+        self.zisk_data_cache.lock().await.contains_key(&batch_number)
+    }
+
     /// Peek batch data for a given batch number
     pub async fn peek_batch_data(&self, batch_number: u64) -> Option<(&str, ProverInput)> {
         match self.jobs.get_prover_input(batch_number).await {
