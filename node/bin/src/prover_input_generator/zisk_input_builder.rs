@@ -218,6 +218,12 @@ fn collect_touched_addresses(
     for diff in &block_output.account_diffs {
         push(diff.address, &mut seen, &mut addrs);
     }
+    // Include all addresses that have storage writes — these are system contracts
+    // (ContractDeployer, NonceHolder, AccountCodeStorage, etc.) that the upgrade
+    // transaction modifies. REVM needs their bytecodes to execute the call chain.
+    for write in &block_output.storage_writes {
+        push(write.account, &mut seen, &mut addrs);
+    }
     addrs
 }
 
