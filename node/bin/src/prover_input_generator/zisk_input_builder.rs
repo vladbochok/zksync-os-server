@@ -89,6 +89,83 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let (mut accounts_map, mut bytecodes_map, mut bytecodes_out) =
         load_accounts_and_bytecodes(&initial_addrs, &mut state_with_preimages, block_output, replay_record);
 
+    // For upgrade txs: pre-create accounts for force-deployed targets.
+    // The ComplexUpgrader's proxy at 0x800f delegates to an implementation whose
+    // address is in the ERC1967 implementation slot. That implementation doesn't
+    // exist yet (it's force-deployed in this block). We must pre-create it.
+    // Also pre-create all addresses from storage_writes and account_diffs.
+    let has_upgrade = transactions.iter().any(|tx| tx.tx_type == 0x7e);
+    if has_upgrade {
+        // Pre-create all addresses from storage writes
+        for write in &block_output.storage_writes {
+            if !accounts_map.contains_key(&write.account) {
+                accounts_map.insert(write.account, AccountInfo {
+                    nonce: 0, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
+                    code: None, account_id: None,
+                });
+            }
+        }
+        // Pre-create all addresses from account diffs
+        for diff in &block_output.account_diffs {
+            if !accounts_map.contains_key(&diff.address) {
+                accounts_map.insert(diff.address, AccountInfo {
+                    nonce: 1, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
+                    code: None, account_id: None,
+                });
+            }
+        }
+        // Pre-create the proxy implementation target.
+        // Read the ERC1967 implementation slot from 0x800f's storage.
+        let proxy_addr: Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
+        let impl_slot = U256::from_be_bytes(
+            B256::from_slice(&alloy::primitives::hex::decode(
+                "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+            ).unwrap()).0
+        );
+        let impl_flat_key = zisk_merkle::derive_flat_storage_key(
+            &proxy_addr.into_array(),
+            &B256::from(impl_slot.to_be_bytes::<32>()),
+        );
+        if let Some(impl_value) = state_view.read(impl_flat_key) {
+            let impl_addr = Address::from_slice(&impl_value.0[12..32]);
+            if !impl_addr.is_zero() && !accounts_map.contains_key(&impl_addr) {
+                // Load the implementation's account from AFTER block execution.
+                // The implementation is force-deployed in this block, so it only
+                // exists at block_number, not block_number-1.
+                let mut state_after = read_state.state_view_at(block_number)?;
+                if let Some(props) = state_after.get_account(impl_addr) {
+                    let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
+                    let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
+                    let effective = if obs_hash.is_zero() { KECCAK_EMPTY } else { obs_hash };
+                    tracing::info!("Pre-creating upgrade implementation at {impl_addr} code_hash={effective}");
+                    accounts_map.insert(impl_addr, AccountInfo {
+                        nonce: props.nonce, balance: props.balance, code_hash: effective,
+                        code: None, account_id: None,
+                    });
+                    // Load bytecode
+                    if !pre_hash.is_zero() {
+                        if let Some(padded_code) = state_after.get_preimage(pre_hash) {
+                            let raw_len = props.unpadded_code_len as usize;
+                            let raw_code = if raw_len > 0 && raw_len <= padded_code.len() {
+                                &padded_code[..raw_len]
+                            } else { &padded_code[..] };
+                            if !bytecodes_map.contains_key(&effective) {
+                                bytecodes_out.push((effective, raw_code.to_vec()));
+                                bytecodes_map.insert(effective, Bytecode::new_raw(Bytes::copy_from_slice(raw_code)));
+                            }
+                        }
+                    }
+                } else {
+                    tracing::info!("Pre-creating empty upgrade implementation at {impl_addr}");
+                    accounts_map.insert(impl_addr, AccountInfo {
+                        nonce: 1, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
+                        code: None, account_id: None,
+                    });
+                }
+            }
+        }
+    }
+
     let mut storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
 
     // Iterative pre-execution: run REVM to discover storage reads and accounts,
