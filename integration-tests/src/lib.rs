@@ -484,12 +484,12 @@ impl Tester {
             node = %log_tag,
             role = %node_role,
         );
-        // Deploy ZiskL1Verifier at the verifier address discovered from L1 contracts.
+        // Deploy ZiskVerifier via standard contract deployment and register it in the DualVerifier.
         if let (Some(bridgehub_addr), Some(chain_id)) = (
             config.genesis_config.bridgehub_address,
             config.genesis_config.chain_id,
         ) {
-            deploy_zisk_l1_verifier(&l1.provider, bridgehub_addr, chain_id).await;
+            deploy_zisk_l1_verifier(&l1.provider, &l1.address, bridgehub_addr, chain_id).await;
         }
 
         tracing::info!(parent: &node_span, "Launching test node");
@@ -1176,14 +1176,31 @@ impl AnvilL1 {
     }
 }
 
-/// Deploy ZiskL1Verifier by replacing the existing verifier's code on Anvil.
-/// Discovers the verifier address dynamically from L1 contracts (Bridgehub → DiamondProxy → getVerifier).
+/// Deploy ZiskVerifier via standard contract deployment and register it in the DualVerifier.
+///
+/// Discovers the current verifier (DualVerifier) from L1 contracts, deploys the ZiskVerifier
+/// contract via a real CREATE transaction, then registers it via `addVerifier(version)`.
 async fn deploy_zisk_l1_verifier(
     l1_provider: &EthDynProvider,
+    l1_rpc_url: &str,
     bridgehub_addr: Address,
     chain_id: u64,
 ) {
+    use alloy::network::TransactionBuilder;
     use zksync_os_contract_interface::l1_discovery::L1State;
+
+    alloy::sol! {
+        #[sol(rpc)]
+        contract IGettersFacet {
+            function getVerifier() external view returns (address);
+        }
+
+        #[sol(rpc)]
+        contract IDualVerifier {
+            function addVerifier(uint32 version, address _fflonkVerifier, address _plonkVerifier) external;
+            function owner() external view returns (address);
+        }
+    }
 
     // Fetch L1 state to discover the verifier address.
     let l1_state = match L1State::fetch(
@@ -1196,21 +1213,15 @@ async fn deploy_zisk_l1_verifier(
     {
         Ok(state) => state,
         Err(e) => {
-            tracing::warn!("Could not fetch L1 state for ZiskL1Verifier deployment: {e:#}");
+            tracing::warn!("Could not fetch L1 state for ZiSK verifier deployment: {e:#}");
             return;
         }
     };
 
-    // Query the diamond proxy for the current verifier address.
-    alloy::sol! {
-        #[sol(rpc)]
-        contract IGettersFacet {
-            function getVerifier() external view returns (address);
-        }
-    }
+    // Query the diamond proxy for the current DualVerifier address.
     let diamond_proxy_addr = l1_state.diamond_proxy_address_sl();
     let getters = IGettersFacet::new(diamond_proxy_addr, DynProvider::new(l1_provider.clone()));
-    let verifier_addr: Address = match getters.getVerifier().call().await {
+    let dual_verifier_addr: Address = match getters.getVerifier().call().await {
         Ok(result) => result,
         Err(e) => {
             tracing::warn!("Could not query getVerifier() on diamond proxy: {e:#}");
@@ -1218,35 +1229,102 @@ async fn deploy_zisk_l1_verifier(
         }
     };
 
-    // Load and deploy the ZiskL1Verifier artifact at the discovered address.
+    // Load the ZiskVerifier artifact (compiled from era-contracts).
     let artifact_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../zksync-os-zisk/contracts/out/ZiskL1Verifier.sol/ZiskL1Verifier.json");
-    if artifact_path.exists() {
+        .join("../../era-contracts/l1-contracts/out/ZiskVerifier.sol/ZiskVerifier.json");
+    let creation_bytecode = if artifact_path.exists() {
         let artifact_json: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&artifact_path).expect("read ZiskL1Verifier artifact"),
+            &std::fs::read_to_string(&artifact_path).expect("read ZiskVerifier artifact"),
         )
-        .expect("parse ZiskL1Verifier artifact");
-        if let Some(hex_str) = artifact_json["deployedBytecode"]["object"].as_str() {
-            let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-            let bytecode = alloy::primitives::Bytes::from(
-                alloy::primitives::hex::decode(raw).expect("decode ZiskL1Verifier bytecode"),
-            );
-            l1_provider
-                .client()
-                .request::<_, ()>("anvil_setCode", (verifier_addr, bytecode))
-                .await
-                .expect("failed to set ZiskL1Verifier code on Anvil");
-            tracing::info!(
-                "Deployed ZiskL1Verifier at {verifier_addr} ({} bytes)",
-                raw.len() / 2
-            );
+        .expect("parse ZiskVerifier artifact");
+        match artifact_json["bytecode"]["object"].as_str() {
+            Some(hex_str) => {
+                let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+                alloy::primitives::Bytes::from(
+                    alloy::primitives::hex::decode(raw).expect("decode ZiskVerifier bytecode"),
+                )
+            }
+            None => {
+                tracing::warn!("ZiskVerifier artifact has no bytecode.object");
+                return;
+            }
         }
     } else {
         tracing::warn!(
-            "ZiskL1Verifier artifact not found at {}; L1 will use original verifier",
+            "ZiskVerifier artifact not found at {}; skipping ZiSK verifier deployment",
             artifact_path.display()
         );
-    }
+        return;
+    };
+
+    // Deploy ZiskVerifier via a standard CREATE transaction.
+    // Use the DualVerifier's owner to send the deployment + addVerifier transactions.
+    let dual_verifier =
+        IDualVerifier::new(dual_verifier_addr, DynProvider::new(l1_provider.clone()));
+    let owner_addr = match dual_verifier.owner().call().await {
+        Ok(addr) => addr,
+        Err(e) => {
+            tracing::warn!("Could not query DualVerifier.owner(): {e:#}");
+            return;
+        }
+    };
+
+    // Impersonate the DualVerifier owner on Anvil to send transactions.
+    l1_provider
+        .client()
+        .request::<_, ()>("anvil_impersonateAccount", (owner_addr,))
+        .await
+        .expect("failed to impersonate DualVerifier owner");
+
+    // Deploy the ZiskVerifier contract via eth_sendTransaction (impersonated, no signing needed).
+    // Use a plain provider (no wallet filler) to avoid the "missing to" error on contract creation.
+    let raw_provider: DynProvider = ProviderBuilder::new()
+        .connect(l1_rpc_url)
+        .await
+        .expect("failed to create raw L1 provider")
+        .erased();
+    let deploy_tx = TransactionRequest::default()
+        .from(owner_addr)
+        .with_input(creation_bytecode);
+    let deploy_receipt = raw_provider
+        .send_transaction(deploy_tx)
+        .await
+        .expect("failed to send ZiskVerifier deploy tx")
+        .with_required_confirmations(1)
+        .get_receipt()
+        .await
+        .expect("ZiskVerifier deploy tx failed");
+    let zisk_verifier_addr = deploy_receipt
+        .contract_address
+        .expect("ZiskVerifier deploy tx has no contract address");
+    tracing::info!("Deployed ZiskVerifier at {zisk_verifier_addr}");
+
+    // Register the ZiskVerifier in the DualVerifier as a plonk verifier.
+    // Use version 0 so it handles proof type 2 with verifier_version=0 (default).
+    // The addVerifier call replaces the existing plonk verifier at version 0.
+    let dual_verifier_raw =
+        IDualVerifier::new(dual_verifier_addr, raw_provider.clone());
+    let add_tx = dual_verifier_raw
+        .addVerifier(0, Address::ZERO, zisk_verifier_addr)
+        .from(owner_addr);
+    add_tx
+        .send()
+        .await
+        .expect("failed to send addVerifier tx")
+        .with_required_confirmations(1)
+        .get_receipt()
+        .await
+        .expect("addVerifier tx failed");
+    tracing::info!(
+        "Registered ZiskVerifier at version 0 in DualVerifier {dual_verifier_addr}"
+    );
+
+    // Stop impersonation.
+    l1_provider
+        .client()
+        .request::<_, ()>("anvil_stopImpersonatingAccount", (owner_addr,))
+        .await
+        .expect("failed to stop impersonation");
 }
 
 #[cfg(feature = "prover-tests")]
