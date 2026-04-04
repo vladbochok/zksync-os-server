@@ -98,7 +98,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let mut seen_addrs: HashSet<Address> = all_addrs.iter().copied().collect();
     let mut all_storage_read_keys = HashSet::new();
     let mut all_storage_reads: Vec<(Address, U256, U256)> = Vec::new();
-    let max_iterations = 5;
+    let max_iterations = 1;
 
     for iteration in 0..max_iterations {
         let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
