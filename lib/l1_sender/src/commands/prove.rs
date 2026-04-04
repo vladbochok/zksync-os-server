@@ -12,6 +12,7 @@ use zksync_os_contract_interface::models::StoredBatchInfo;
 const OHBENDER_PROOF_TYPE: u32 = 2;
 const FAKE_PROOF_TYPE: u32 = 3;
 const FAKE_PROOF_MAGIC_VALUE: u32 = 13;
+#[cfg(test)]
 const TWO_PROOF_SYSTEM_TYPE: u32 = 4;
 
 #[derive(Debug)]
@@ -224,18 +225,6 @@ impl ProofCommand {
                         "Cross-proof validation passed: ZiSK and Era batch commitments match"
                     );
                 }
-
-                // Era SNARK proof as U256 chunks
-                let era_chunks: Vec<U256> = two_proof
-                    .era_proof
-                    .chunks(32)
-                    .map(|chunk| {
-                        let arr: [u8; 32] = chunk
-                            .try_into()
-                            .expect("era proof bytes must be a multiple of 32");
-                        U256::from_be_bytes(arr)
-                    })
-                    .collect();
 
                 // ZiSK SNARK proof as U256 chunks (always 24 elements = 768 bytes)
                 let zisk_proof_chunks: Vec<U256> = two_proof

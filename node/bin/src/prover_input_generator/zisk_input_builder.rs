@@ -20,7 +20,7 @@ use zksync_os_interface::types::BlockOutput;
 use zksync_os_merkle_tree::{MerkleTreeVersion, RocksDBWrapper};
 use zksync_os_revm::transaction::abstraction::ZKsyncTxBuilder;
 use zksync_os_revm::{DefaultZk, ZKsyncTx, ZkBuilder, ZkContext, ZkSpecId};
-use zksync_os_storage_api::{OverriddenStateView, ReadStateHistory, ReplayRecord, ViewState};
+use zksync_os_storage_api::{ReadStateHistory, ReplayRecord, ViewState};
 use zksync_os_types::{ExecutionVersion, ZkEnvelope, ZkTransaction};
 
 use serde::{Deserialize, Serialize};
@@ -168,14 +168,17 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     let mut storage_prestate = load_storage_prestate(&block_output.storage_writes, &mut state_view);
 
-    // Iterative pre-execution: run REVM to discover storage reads and accounts,
-    // load them, then re-run until stable. This handles deep call chains where
-    // each level reads new storage/accounts (e.g. proxy → implementation → system contracts).
     let mut all_addrs = initial_addrs;
     let mut seen_addrs: HashSet<Address> = all_addrs.iter().copied().collect();
     let mut all_storage_read_keys = HashSet::new();
     let mut all_storage_reads: Vec<(Address, U256, U256)> = Vec::new();
-    let max_iterations = 1;
+
+    // Skip pre-execution for upgrade/system transactions — their writes are
+    // bootloader-level flat storage operations that REVM can't reproduce.
+    // Pre-execution is only useful for user transactions where REVM traces
+    // the full EVM call chain.
+    let skip_pre_execution = has_upgrade;
+    let max_iterations = if skip_pre_execution { 0 } else { 1 };
 
     for iteration in 0..max_iterations {
         let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
@@ -703,58 +706,6 @@ fn build_tree_update(
         intermediate_hashes_new,
         leaf_count_before: leaf_count,
     }
-}
-
-/// Compute intermediate hashes by simulating the zip_leaves consumption order.
-/// Uses a prebuilt index for O(1) sibling lookup instead of O(n) scan.
-fn compute_intermediate_hashes(
-    leaf_indices: &[u64],
-    leaf_proofs: &HashMap<u64, LeafWithProof>,
-    leaf_count: u64,
-) -> Vec<B256> {
-    // Build index: for each (depth, node_idx_on_level) → leaf proof index
-    // A leaf T at depth D has node T >> D. siblings[D] is sibling of that node.
-    let mut sibling_index: HashMap<(u8, u64), u64> = HashMap::new();
-    for proof in leaf_proofs.values() {
-        for d in 0..TREE_DEPTH {
-            let node = proof.index >> d;
-            sibling_index.entry((d, node)).or_insert(proof.index);
-        }
-    }
-
-    let mut result = Vec::new();
-    let mut node_indices: Vec<u64> = leaf_indices.to_vec();
-    let mut last_idx_on_level = leaf_count - 1;
-
-    for depth in 0..TREE_DEPTH {
-        let mut i = 0;
-        let mut next_level = Vec::new();
-
-        while i < node_indices.len() {
-            let idx = node_indices[i];
-            if idx % 2 == 1 {
-                // Odd: needs left sibling
-                let leaf_idx = sibling_index[&(depth, idx)];
-                result.push(leaf_proofs[&leaf_idx].siblings[depth as usize]);
-                next_level.push(idx / 2);
-                i += 1;
-            } else if node_indices.get(i + 1).copied() == Some(idx + 1) {
-                // Both present
-                next_level.push(idx / 2);
-                i += 2;
-            } else {
-                if idx != last_idx_on_level {
-                    let leaf_idx = sibling_index[&(depth, idx)];
-                    result.push(leaf_proofs[&leaf_idx].siblings[depth as usize]);
-                }
-                next_level.push(idx / 2);
-                i += 1;
-            }
-        }
-        node_indices = next_level;
-        last_idx_on_level /= 2;
-    }
-    result
 }
 
 /// Compute intermediate hashes for both old and new leaf sets.

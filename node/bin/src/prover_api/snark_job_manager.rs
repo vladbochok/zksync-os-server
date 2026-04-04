@@ -281,23 +281,61 @@ impl SnarkJobManager {
             };
 
             let snark_proof = if let Some(zisk_bincode) = zisk_data {
-                // Generate real ZiSK SNARK proof by running the full pipeline.
-                // This is CPU-intensive (~15 min), so run on a blocking thread.
-                tracing::info!(batch = first_batch, "Starting ZiSK proof generation ({} bytes input)", zisk_bincode.len());
+                let real_snark = std::env::var("ZISK_REAL_PROOFS").is_ok();
+                if real_snark {
+                    // Generate real ZiSK SNARK proof by running the full pipeline.
+                    // This is CPU-intensive (~15 min), so run on a blocking thread.
+                    tracing::info!(batch = first_batch, "Starting REAL ZiSK proof generation ({} bytes input)", zisk_bincode.len());
+                } else {
+                    tracing::info!(batch = first_batch, "Computing ZiSK batch commitment (set ZISK_REAL_PROOFS=1 for real SNARK)");
+                }
                 let batch_num = first_batch;
-                let result = tokio::task::spawn_blocking(move || {
-                    generate_zisk_snark_proof(&zisk_bincode, batch_num)
-                }).await.map_err(|e| format!("spawn_blocking: {e}"));
+                let result = if real_snark {
+                    tokio::task::spawn_blocking(move || {
+                        generate_zisk_snark_proof(&zisk_bincode, batch_num)
+                    }).await.map_err(|e| format!("spawn_blocking: {e}"))
+                } else {
+                    // Native commitment computation only — timeout after 120s
+                    let handle = tokio::task::spawn_blocking(move || {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            zksync_os_zisk_lib::executor::execute_and_commit_from_bincode(&zisk_bincode)
+                        })) {
+                            Ok(Ok((_output, commitment))) => {
+                                let hash_bytes: [u8; 32] = commitment.into();
+                                let mut pv = vec![0u8; 256];
+                                pv[..32].copy_from_slice(&hash_bytes);
+                                Ok((vec![0u8; 768], pv))
+                            }
+                            Ok(Err(e)) => Err(e),
+                            Err(panic_info) => {
+                                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                Err(format!("ZiSK execution panicked: {msg}"))
+                            }
+                        }
+                    });
+                    match tokio::time::timeout(Duration::from_secs(120), handle).await {
+                        Ok(join_result) => join_result.map_err(|e| format!("spawn_blocking: {e}")),
+                        Err(_) => Err("ZiSK commitment computation timed out (120s)".to_string()),
+                    }
+                };
                 match result.and_then(|r| r) {
                     Ok((snark_proof_bytes, public_values)) => {
+                        let is_real = snark_proof_bytes.iter().any(|&b| b != 0);
                         tracing::info!(
                             batch = first_batch,
-                            snark_bytes = snark_proof_bytes.len(),
-                            pv_bytes = public_values.len(),
-                            "ZiSK SNARK proof generated successfully"
+                            real_snark = is_real,
+                            commitment = %alloy::primitives::B256::from_slice(&public_values[..32]),
+                            "ZiSK proof ready"
                         );
-                        SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
-                            era_proof: vec![0u8; 32], // placeholder Era proof
+                        if is_real {
+                            SnarkProof::TwoProofSystem(TwoProofSystemSnarkProof {
+                                era_proof: vec![0u8; 32],
                             zisk_proof: snark_proof_bytes,
                             zisk_public_values: public_values,
                             proving_execution_version: completed
@@ -306,6 +344,10 @@ impl SnarkJobManager {
                                 .batch
                                 .execution_version,
                         })
+                        } else {
+                            // Commitment computed but no real SNARK — use fake proof for L1
+                            SnarkProof::Fake
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(batch = first_batch, "ZiSK proof generation failed: {e}");
@@ -456,10 +498,13 @@ impl FakeSnarkProver {
     pub async fn run(self) {
         loop {
             tokio::time::sleep(self.polling_interval).await;
-            self.job_manager
+            if let Err(e) = self
+                .job_manager
                 .process_pending_fake_or_timed_out_fri_proofs(Some(self.max_batch_age))
                 .await
-                .expect("snark prover failed");
+            {
+                tracing::error!("FakeSnarkProver error (will retry): {e:#}");
+            }
         }
     }
 }
