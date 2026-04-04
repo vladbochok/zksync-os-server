@@ -484,6 +484,14 @@ impl Tester {
             node = %log_tag,
             role = %node_role,
         );
+        // Deploy ZiskL1Verifier at the verifier address discovered from L1 contracts.
+        if let (Some(bridgehub_addr), Some(chain_id)) = (
+            config.genesis_config.bridgehub_address,
+            config.genesis_config.chain_id,
+        ) {
+            deploy_zisk_l1_verifier(&l1.provider, bridgehub_addr, chain_id).await;
+        }
+
         tracing::info!(parent: &node_span, "Launching test node");
         zksync_os_server::run::<FullDiffsState>(&runtime, config)
             .instrument(node_span)
@@ -1159,41 +1167,85 @@ impl AnvilL1 {
 
         tracing::info!("L1 chain started on {}", address);
 
-        // Deploy ZiskL1Verifier by replacing the existing verifier's code on Anvil.
-        // This makes the L1 verify real ZiSK SNARK proofs for proof type 4,
-        // while still accepting fake proofs (type 3) for backward compatibility.
-        let verifier_addr: Address = "0x983201edc53eabb33dd6c6ce24389664e793f73e".parse().unwrap();
-        let artifact_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../zksync-os-zisk/contracts/out/ZiskL1Verifier.sol/ZiskL1Verifier.json");
-        if artifact_path.exists() {
-            let artifact_json: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&artifact_path).expect("read ZiskL1Verifier artifact")
-            ).expect("parse ZiskL1Verifier artifact");
-            if let Some(hex_str) = artifact_json["deployedBytecode"]["object"].as_str() {
-                let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-                let bytecode = alloy::primitives::Bytes::from(
-                    alloy::primitives::hex::decode(raw).expect("decode ZiskL1Verifier bytecode")
-                );
-                let _: () = provider.client().request("anvil_setCode", (verifier_addr, bytecode)).await
-                    .expect("failed to set ZiskL1Verifier code on Anvil");
-                tracing::info!(
-                    "Deployed ZiskL1Verifier at {verifier_addr} ({} bytes) — L1 now verifies real ZiSK proofs",
-                    raw.len() / 2
-                );
-            }
-        } else {
-            tracing::warn!(
-                "ZiskL1Verifier artifact not found at {}; L1 will use original verifier",
-                artifact_path.display()
-            );
-        }
-
         Ok(Self {
             address,
             provider: EthDynProvider::new(provider),
             wallet,
             _tempdir: Arc::new(tempdir),
         })
+    }
+}
+
+/// Deploy ZiskL1Verifier by replacing the existing verifier's code on Anvil.
+/// Discovers the verifier address dynamically from L1 contracts (Bridgehub → DiamondProxy → getVerifier).
+async fn deploy_zisk_l1_verifier(
+    l1_provider: &EthDynProvider,
+    bridgehub_addr: Address,
+    chain_id: u64,
+) {
+    use zksync_os_contract_interface::l1_discovery::L1State;
+
+    // Fetch L1 state to discover the verifier address.
+    let l1_state = match L1State::fetch(
+        DynProvider::new(l1_provider.clone()),
+        None,
+        bridgehub_addr,
+        chain_id,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(e) => {
+            tracing::warn!("Could not fetch L1 state for ZiskL1Verifier deployment: {e:#}");
+            return;
+        }
+    };
+
+    // Query the diamond proxy for the current verifier address.
+    alloy::sol! {
+        #[sol(rpc)]
+        contract IGettersFacet {
+            function getVerifier() external view returns (address);
+        }
+    }
+    let diamond_proxy_addr = l1_state.diamond_proxy_address_sl();
+    let getters = IGettersFacet::new(diamond_proxy_addr, DynProvider::new(l1_provider.clone()));
+    let verifier_addr: Address = match getters.getVerifier().call().await {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("Could not query getVerifier() on diamond proxy: {e:#}");
+            return;
+        }
+    };
+
+    // Load and deploy the ZiskL1Verifier artifact at the discovered address.
+    let artifact_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../zksync-os-zisk/contracts/out/ZiskL1Verifier.sol/ZiskL1Verifier.json");
+    if artifact_path.exists() {
+        let artifact_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&artifact_path).expect("read ZiskL1Verifier artifact"),
+        )
+        .expect("parse ZiskL1Verifier artifact");
+        if let Some(hex_str) = artifact_json["deployedBytecode"]["object"].as_str() {
+            let raw = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+            let bytecode = alloy::primitives::Bytes::from(
+                alloy::primitives::hex::decode(raw).expect("decode ZiskL1Verifier bytecode"),
+            );
+            l1_provider
+                .client()
+                .request::<_, ()>("anvil_setCode", (verifier_addr, bytecode))
+                .await
+                .expect("failed to set ZiskL1Verifier code on Anvil");
+            tracing::info!(
+                "Deployed ZiskL1Verifier at {verifier_addr} ({} bytes)",
+                raw.len() / 2
+            );
+        }
+    } else {
+        tracing::warn!(
+            "ZiskL1Verifier artifact not found at {}; L1 will use original verifier",
+            artifact_path.display()
+        );
     }
 }
 
