@@ -1284,6 +1284,10 @@ async fn deploy_multi_proof_verifier(
         Some(b) => b,
         None => return,
     };
+    let testnet_verifier_bytecode = match load_artifact("TestnetVerifier") {
+        Some(b) => b,
+        None => return,
+    };
 
     // Impersonate owner for deployment transactions.
     l1_provider
@@ -1343,10 +1347,31 @@ async fn deploy_multi_proof_verifier(
         .expect("MultiProofVerifier has no contract address");
     tracing::info!("Deployed MultiProofVerifier at {multi_proof_addr}");
 
-    // Update the diamond proxy's s.verifier storage slot to point to MultiProofVerifier.
+    // Wrap with TestnetVerifier for mock proof support (testnet/integration tests).
+    let testnet_constructor = alloy::sol_types::SolValue::abi_encode(&(multi_proof_addr,));
+    let mut testnet_deploy_data = testnet_verifier_bytecode.to_vec();
+    testnet_deploy_data.extend_from_slice(&testnet_constructor);
+    let testnet_receipt = raw_provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(owner_addr)
+                .with_input(alloy::primitives::Bytes::from(testnet_deploy_data)),
+        )
+        .await
+        .expect("TestnetVerifier deploy tx send failed")
+        .with_required_confirmations(1)
+        .get_receipt()
+        .await
+        .expect("TestnetVerifier deploy tx failed");
+    let testnet_verifier_addr = testnet_receipt
+        .contract_address
+        .expect("TestnetVerifier has no contract address");
+    tracing::info!("Deployed TestnetVerifier at {testnet_verifier_addr} wrapping MultiProofVerifier");
+
+    // Update the diamond proxy's s.verifier storage slot to point to TestnetVerifier.
     // In ZKChainStorage: verifier is at slot 10 (after 7 deprecated uint256 + 2 addresses + 1 mapping).
     let verifier_slot = B256::from(U256::from(10).to_be_bytes::<32>());
-    let verifier_value = B256::left_padding_from(multi_proof_addr.as_slice());
+    let verifier_value = B256::left_padding_from(testnet_verifier_addr.as_slice());
     let _: bool = l1_provider
         .client()
         .request(
@@ -1363,11 +1388,11 @@ async fn deploy_multi_proof_verifier(
         .await
         .expect("getVerifier after update failed");
     assert_eq!(
-        new_verifier, multi_proof_addr,
+        new_verifier, testnet_verifier_addr,
         "verifier address not updated correctly"
     );
     tracing::info!(
-        "Diamond proxy verifier updated: {dual_verifier_addr} → {multi_proof_addr} (MultiProofVerifier)"
+        "Diamond proxy verifier updated: {dual_verifier_addr} → {testnet_verifier_addr} (TestnetVerifier → MultiProofVerifier)"
     );
 
     // Stop impersonation.
