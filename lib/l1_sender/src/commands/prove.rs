@@ -194,35 +194,38 @@ impl ProofCommand {
                 .collect()
             }
             SnarkProof::MultiProof(multi_proof) => {
-                // Cross-proof validation: verify ZiSK commitment matches Era public input.
-                // ZiSK public values first 32 bytes = batch commitment (full keccak256).
-                // Era public input = batch commitment >> 32.
-                // These must match for the proofs to be for the same batch.
-                assert!(
-                    multi_proof.zisk_public_values.len() == 256,
-                    "ZiSK public values must be exactly 256 bytes"
+                // Validate proof sizes (invariants from MultiProofSnarkProof construction).
+                assert_eq!(
+                    multi_proof.zisk_proof.len(), 768,
+                    "ZiSK proof must be exactly 768 bytes, got {}",
+                    multi_proof.zisk_proof.len()
                 );
+                assert_eq!(
+                    multi_proof.zisk_public_values.len(), 256,
+                    "ZiSK public values must be exactly 256 bytes, got {}",
+                    multi_proof.zisk_public_values.len()
+                );
+                assert!(
+                    multi_proof.era_proof.len() % 32 == 0,
+                    "Era proof must be a multiple of 32 bytes, got {}",
+                    multi_proof.era_proof.len()
+                );
+
+                // Cross-proof validation: both proof systems must commit to the same batch.
                 let zisk_commitment =
                     B256::from_slice(&multi_proof.zisk_public_values[..32]);
-
-                // For a single batch, public_input = get_batch_public_input(prev, batch)
-                // For multiple batches, it's a chained hash. In both cases, the ZiSK
-                // commitment should match the first individual batch commitment since
-                // ZiSK currently proves one batch at a time.
                 let first_batch_input = Self::get_batch_public_input(
                     previous_batch_info,
-                    stored_batch_infos.first().unwrap(),
+                    stored_batch_infos
+                        .first()
+                        .expect("stored_batch_infos must not be empty"),
                 );
-                if zisk_commitment != first_batch_input {
-                    tracing::warn!(
-                        "ZiSK batch commitment {zisk_commitment} does not match Era batch commitment {first_batch_input}. \
-                         This is expected for genesis/system batches where ZiSK merkle proofs differ."
-                    );
-                } else {
-                    tracing::info!(
-                        "Cross-proof validation passed: ZiSK and Era batch commitments match"
-                    );
-                }
+                assert_eq!(
+                    zisk_commitment, first_batch_input,
+                    "ZiSK batch commitment {zisk_commitment} does not match \
+                     Era batch commitment {first_batch_input}"
+                );
+                tracing::info!("Cross-proof validation passed: commitments match");
 
                 // Era (Airbender) SNARK proof as U256 chunks
                 let era_chunks: Vec<U256> = multi_proof

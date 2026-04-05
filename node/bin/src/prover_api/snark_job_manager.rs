@@ -1,6 +1,7 @@
 use crate::prover_api::fri_job_manager::{FriJob, FriJobManager};
 use crate::prover_api::metrics::{ProverStage, ProverType};
 use crate::prover_api::prover_job_map::ProverJobMap;
+use crate::prover_api::zisk_prover::ZiskProver;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,9 +97,6 @@ impl SnarkJobManager {
     /// Submit a real Airbender SNARK proof.
     ///
     /// If ZiSK data exists, the Airbender SNARK is cached for async combination.
-    /// The MultiProofCombiner background task will generate the ZiSK SNARK and
-    /// send the combined MultiProof downstream.
-    ///
     /// If no ZiSK data exists, the Airbender proof is sent downstream immediately.
     pub async fn submit_proof(
         &self,
@@ -119,14 +117,13 @@ impl SnarkJobManager {
         let server_vk = consumed_batches_proven[0]
             .batch
             .verification_key_hash()
-            .expect("verification key hash must be present");
+            .expect("verification key hash must be present as it was set by server");
         let prover_vk = proving_version.vk_hash();
         anyhow::ensure!(
             server_vk == prover_vk,
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
-        // Check if ZiSK data exists — if so, cache for async combination.
         let has_zisk = if let Some(ref fjm) = self.fri_job_manager {
             fjm.peek_zisk_data(batch_from).await
         } else {
@@ -136,6 +133,7 @@ impl SnarkJobManager {
         if has_zisk {
             tracing::info!(
                 batch = batch_from,
+                era_proof_bytes = payload.len(),
                 "Airbender SNARK received, queuing for ZiSK combination"
             );
             let batches: Vec<_> = consumed_batches_proven
@@ -152,7 +150,6 @@ impl SnarkJobManager {
             );
             Ok(())
         } else {
-            // No ZiSK data — send Airbender-only proof immediately.
             let consumed_batches_proven: Vec<_> = consumed_batches_proven
                 .into_iter()
                 .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
@@ -171,17 +168,25 @@ impl SnarkJobManager {
 
     /// Process one pending multi-proof: generate ZiSK SNARK and combine.
     /// Called by the MultiProofCombiner background task.
-    async fn process_one_pending_multi_proof(&self) -> anyhow::Result<bool> {
-        // Peek at the first pending batch without removing it.
-        let batch_num = {
-            let map = self.pending_multi_proofs.lock().await;
-            match map.keys().next().copied() {
-                Some(k) => k,
-                None => return Ok(false),
-            }
+    ///
+    /// Atomically removes the pending entry to prevent concurrent processing.
+    /// On failure, re-inserts the entry for retry.
+    async fn process_one_pending_multi_proof(
+        &self,
+        zisk_prover: &ZiskProver,
+    ) -> anyhow::Result<bool> {
+        // Atomically take the first pending batch.
+        let (batch_num, pending) = {
+            let mut map = self.pending_multi_proofs.lock().await;
+            let Some(&batch_num) = map.keys().next() else {
+                return Ok(false);
+            };
+            // Remove to prevent concurrent processing. Re-insert on failure.
+            let pending = map.remove(&batch_num).unwrap();
+            (batch_num, pending)
         };
 
-        // Clone ZiSK data (don't remove — we may need to retry on failure).
+        // Clone ZiSK data (preserve original for retry).
         let zisk_bincode = if let Some(ref fjm) = self.fri_job_manager {
             fjm.clone_zisk_data(batch_num).await
         } else {
@@ -189,7 +194,12 @@ impl SnarkJobManager {
         };
 
         let Some(zisk_bincode) = zisk_bincode else {
-            anyhow::bail!("ZiSK data missing for batch {batch_num} — cannot produce multi-proof");
+            // Re-insert for retry.
+            self.pending_multi_proofs
+                .lock()
+                .await
+                .insert(batch_num, pending);
+            anyhow::bail!("ZiSK data missing for batch {batch_num}");
         };
 
         tracing::info!(
@@ -197,40 +207,44 @@ impl SnarkJobManager {
             zisk_input_bytes = zisk_bincode.len(),
             "Generating ZiSK SNARK for multi-proof"
         );
+
+        let prover = zisk_prover.clone();
         let zisk_result = tokio::task::spawn_blocking(move || {
-            generate_zisk_snark_proof(&zisk_bincode, batch_num)
+            prover.generate_proof(&zisk_bincode, batch_num)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("ZiSK spawn_blocking: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("ZiSK spawn_blocking join error: {e}"))?;
 
-        let (zisk_proof, zisk_public_values) = zisk_result
-            .map_err(|e| anyhow::anyhow!("ZiSK SNARK failed for batch {batch_num}: {e}"))?;
+        match zisk_result {
+            Ok(output) => {
+                // Success — remove ZiSK data from cache.
+                if let Some(ref fjm) = self.fri_job_manager {
+                    fjm.take_zisk_data(batch_num).await;
+                }
 
-        // ZiSK SNARK succeeded — remove both the pending proof and ZiSK data.
-        let pending = self
-            .pending_multi_proofs
-            .lock()
-            .await
-            .remove(&batch_num)
-            .expect("pending multi-proof disappeared");
-        if let Some(ref fjm) = self.fri_job_manager {
-            fjm.take_zisk_data(batch_num).await;
+                tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
+                let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
+                    era_proof: pending.era_proof,
+                    zisk_proof: output.proof,
+                    zisk_public_values: output.public_values,
+                    proving_execution_version: pending.proving_version,
+                });
+                self.send_downstream(ProofCommand::new(pending.batches, snark_proof))
+                    .await?;
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::error!(batch = batch_num, "ZiSK SNARK failed: {e:#}");
+                // Re-insert for retry.
+                self.pending_multi_proofs
+                    .lock()
+                    .await
+                    .insert(batch_num, pending);
+                Err(e.into())
+            }
         }
-
-        tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
-        let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
-            era_proof: pending.era_proof,
-            zisk_proof,
-            zisk_public_values,
-            proving_execution_version: pending.proving_version,
-        });
-
-        self.send_downstream(ProofCommand::new(pending.batches, snark_proof))
-            .await?;
-        Ok(true)
     }
 
-    /// Consumes fake FRI proofs from the head of the queue and turns them into fake SNARKs.
     async fn process_pending_fake_fri_proofs(&self) -> anyhow::Result<()> {
         self.process_pending_fake_or_timed_out_fri_proofs(None)
             .await
@@ -245,25 +259,28 @@ impl SnarkJobManager {
                 .jobs
                 .pick_jobs_while_with_limit(self.max_fris_per_snark, "fake_prover", |job| {
                     job.batch_envelope.data.is_fake()
-                        || (timeout_for_real_fris.is_some()
-                            && job.metadata.added_at.elapsed() >= timeout_for_real_fris.unwrap())
+                        || timeout_for_real_fris
+                            .is_some_and(|t| job.metadata.added_at.elapsed() >= t)
                 })
                 .await;
 
             if assigned.is_empty() {
                 return Ok(());
             }
+
             let real_proofs_count = assigned
                 .iter()
                 .filter(|(_, proof)| !proof.is_fake())
                 .count();
-            tracing::info!(
-                "consuming fake proofs for SNARKing for batches {}-{} ({} real proofs; {} fake proofs)",
-                assigned.first().unwrap().0.batch_number,
-                assigned.last().unwrap().0.batch_number,
-                real_proofs_count,
-                assigned.len() - real_proofs_count,
-            );
+            if let (Some(first), Some(last)) = (assigned.first(), assigned.last()) {
+                tracing::info!(
+                    from_batch = first.0.batch_number,
+                    to_batch = last.0.batch_number,
+                    real_proofs_count,
+                    fake_proofs_count = assigned.len() - real_proofs_count,
+                    "consuming proofs for fake SNARKing"
+                );
+            }
 
             let mut completed = Vec::default();
             for (job, _) in assigned {
@@ -294,6 +311,11 @@ impl SnarkJobManager {
             .enter_state(GenericComponentState::ProcessingOrWaitingRecv);
         Ok(())
     }
+
+    /// Check if there are pending multi-proofs.
+    pub async fn has_pending_multi_proofs(&self) -> bool {
+        !self.pending_multi_proofs.lock().await.is_empty()
+    }
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
@@ -312,108 +334,10 @@ pub struct FakeSnarkProver {
 /// the Airbender prover.
 pub struct MultiProofCombiner {
     job_manager: Arc<SnarkJobManager>,
+    zisk_prover: ZiskProver,
     gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
     polling_interval: Duration,
-}
-
-/// Generate a real ZiSK SNARK proof by running the full GPU-accelerated pipeline.
-/// Uses `cargo-zisk prove --snark` for combined STARK aggregation + SNARK wrapping.
-/// Returns (snark_proof_bytes[768], public_values[256]).
-fn generate_zisk_snark_proof(
-    zisk_bincode: &[u8],
-    batch_number: u64,
-) -> Result<(Vec<u8>, Vec<u8>), String> {
-    use std::process::Command;
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let zisk_bin = format!("{home}/.zisk/bin");
-    let elf_path = format!(
-        "{home}/zksync-os-second-proof-system/zksync-os-zisk/guest/target/riscv64ima-zisk-zkvm-elf/release/zksync-os-zisk-guest"
-    );
-    let proving_key = format!("{home}/.zisk/provingKey");
-    let snark_key = format!("{home}/.zisk/provingKeySnark");
-
-    let work_dir = format!("/tmp/zisk_prove_batch_{batch_number}");
-    let _ = std::fs::create_dir_all(&work_dir);
-
-    // Write ZiSK stdin format: [len:u64_LE][bincode][padding]
-    let input_path = format!("{work_dir}/input.bin");
-    {
-        let len = zisk_bincode.len() as u64;
-        let mut buf = Vec::with_capacity(8 + zisk_bincode.len() + 8);
-        buf.extend_from_slice(&len.to_le_bytes());
-        buf.extend_from_slice(zisk_bincode);
-        let total = 8 + zisk_bincode.len();
-        let padding = (8 - (total % 8)) % 8;
-        buf.extend(std::iter::repeat(0u8).take(padding));
-        std::fs::write(&input_path, &buf).map_err(|e| format!("write input: {e}"))?;
-    }
-
-    // STARK aggregation (GPU-accelerated)
-    let stark_dir = format!("{work_dir}/stark");
-    let _ = std::fs::create_dir_all(format!("{stark_dir}/proofs"));
-    tracing::info!(batch_number, "Running ZiSK STARK aggregation (GPU)...");
-    let stark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
-        .args([
-            "prove", "-e", &elf_path, "-i", &input_path, "-k", &proving_key, "-o", &stark_dir,
-            "--emulator", "--aggregation", "--save-proofs", "-v",
-        ])
-        .output()
-        .map_err(|e| format!("cargo-zisk prove: {e}"))?;
-    if !stark_output.status.success() {
-        let stderr = String::from_utf8_lossy(&stark_output.stderr);
-        return Err(format!(
-            "STARK aggregation failed: {}",
-            &stderr[stderr.len().saturating_sub(1000)..]
-        ));
-    }
-    let vadcop_path = format!("{stark_dir}/vadcop_final_proof.bin");
-    if !std::path::Path::new(&vadcop_path).exists() {
-        return Err("vadcop_final_proof.bin not generated".into());
-    }
-
-    // SNARK wrapping
-    let snark_dir = format!("{work_dir}/snark");
-    let _ = std::fs::create_dir_all(&snark_dir);
-    tracing::info!(batch_number, "Running ZiSK SNARK wrapping...");
-    let snark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
-        .args([
-            "prove-snark", "--proof", &vadcop_path, "--elf", &elf_path,
-            "--proving-key-snark", &snark_key, "-o", &snark_dir, "-v",
-        ])
-        .output()
-        .map_err(|e| format!("cargo-zisk prove-snark: {e}"))?;
-    if !snark_output.status.success() {
-        let stderr = String::from_utf8_lossy(&snark_output.stderr);
-        return Err(format!(
-            "SNARK wrapping failed: {}",
-            &stderr[stderr.len().saturating_sub(1000)..]
-        ));
-    }
-
-    let snark_proof_path = format!("{snark_dir}/final_snark_proof.bin");
-    if !std::path::Path::new(&snark_proof_path).exists() {
-        return Err("final_snark_proof.bin not generated".into());
-    }
-
-    // Parse output: [proof_len:u64_LE][proof_bytes][pv_len:u64_LE][pv_bytes]
-    let data = std::fs::read(&snark_proof_path).map_err(|e| format!("read SNARK: {e}"))?;
-    let proof_len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-    if proof_len != 768 {
-        return Err(format!("unexpected proof length: {proof_len}, expected 768"));
-    }
-    let snark_proof_bytes = data[8..8 + 768].to_vec();
-    let pv_offset = 8 + 768;
-    let pv_len = u64::from_le_bytes(data[pv_offset..pv_offset + 8].try_into().unwrap()) as usize;
-    if pv_len != 256 {
-        return Err(format!(
-            "unexpected public values length: {pv_len}, expected 256"
-        ));
-    }
-    let public_values = data[pv_offset + 8..pv_offset + 8 + 256].to_vec();
-
-    tracing::info!(batch_number, work_dir, "ZiSK SNARK proof generated");
-    Ok((snark_proof_bytes, public_values))
+    retry_delay: Duration,
 }
 
 impl FakeSnarkProver {
@@ -442,51 +366,49 @@ impl FakeSnarkProver {
 impl MultiProofCombiner {
     pub fn new(
         job_manager: Arc<SnarkJobManager>,
+        zisk_prover: ZiskProver,
         gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
     ) -> Self {
         Self {
             job_manager,
+            zisk_prover,
             gpu_coordinator,
             polling_interval: Duration::from_millis(POLL_INTERVAL_MS),
+            retry_delay: Duration::from_secs(60),
         }
     }
 
     pub async fn run(self) {
         loop {
-            // Check if there's a pending proof before acquiring GPU.
-            let has_pending = !self
-                .job_manager
-                .pending_multi_proofs
-                .lock()
-                .await
-                .is_empty();
-
-            if !has_pending {
+            if !self.job_manager.has_pending_multi_proofs().await {
                 tokio::time::sleep(self.polling_interval).await;
                 continue;
             }
 
             // Acquire GPU if coordinator is present (waits for Airbender to exit).
             if let Some(ref coord) = self.gpu_coordinator {
-                tracing::info!("MultiProofCombiner: waiting for GPU (Airbender prover to exit)...");
+                tracing::info!("MultiProofCombiner: waiting for GPU");
                 coord.acquire_gpu_for_zisk().await;
-                tracing::info!("MultiProofCombiner: GPU acquired, starting ZiSK");
+                tracing::info!("MultiProofCombiner: GPU acquired");
             }
 
             // Process all pending proofs while we hold the GPU.
             loop {
-                match self.job_manager.process_one_pending_multi_proof().await {
+                match self
+                    .job_manager
+                    .process_one_pending_multi_proof(&self.zisk_prover)
+                    .await
+                {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(e) => {
-                        tracing::error!("MultiProofCombiner error: {e:#}");
-                        // Don't retry immediately — release GPU first.
+                        tracing::error!("MultiProofCombiner error (retry in {:?}): {e:#}", self.retry_delay);
                         break;
                     }
                 }
             }
 
-            // Release GPU so the orchestrator can restart the Airbender prover.
+            // Release GPU.
             if let Some(ref coord) = self.gpu_coordinator {
                 coord.release_gpu_from_zisk().await;
                 tracing::info!("MultiProofCombiner: GPU released");
@@ -494,3 +416,4 @@ impl MultiProofCombiner {
         }
     }
 }
+

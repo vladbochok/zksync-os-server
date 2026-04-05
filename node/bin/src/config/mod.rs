@@ -890,9 +890,27 @@ pub struct ProverInputGeneratorConfig {
     #[config(default_t = false)]
     pub multi_proof_verifier: bool,
 
+    // -- ZiSK prover paths (required when second_proof_system = true) --
+
+    /// Path to the cargo-zisk binary.
+    pub zisk_binary: Option<String>,
+
+    /// Path to the ZiSK guest ELF binary.
+    pub zisk_elf_path: Option<String>,
+
+    /// Path to the ZiSK STARK proving key directory.
+    pub zisk_proving_key: Option<String>,
+
+    /// Path to the ZiSK SNARK proving key directory.
+    pub zisk_proving_key_snark: Option<String>,
+
+    /// Directory for intermediate ZiSK proof files. Cleaned up after each proof.
+    pub zisk_work_dir: Option<String>,
+
+    // -- Airbender GPU prover orchestration (optional) --
+
     /// Path to the Airbender GPU prover binary. When set, the server manages the
-    /// prover process lifecycle for GPU sharing: Airbender runs first (GPU), then
-    /// ZiSK runs (GPU), in alternating rounds. Implies `second_proof_system = true`.
+    /// prover process lifecycle for GPU sharing with ZiSK.
     pub gpu_prover_binary: Option<String>,
 
     /// Path to the trusted setup CRS file for the Airbender SNARK prover.
@@ -900,6 +918,17 @@ pub struct ProverInputGeneratorConfig {
 
     /// Path to the ZKsync OS app binary for the Airbender prover.
     pub gpu_prover_app_bin: Option<String>,
+
+    /// Working directory for Airbender prover output files.
+    pub gpu_prover_output_dir: Option<String>,
+
+    /// Timeout for the Airbender prover process per round (seconds).
+    #[config(default_t = 7200)]
+    pub gpu_prover_timeout_secs: u64,
+
+    /// Number of SNARK proofs per round before exiting to free GPU for ZiSK.
+    #[config(default_t = 1)]
+    pub gpu_prover_iterations_per_round: u32,
 }
 
 /// Only used on the Main Node.
