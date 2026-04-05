@@ -44,6 +44,16 @@ pub(super) struct ZiskBatchDataPayload {
     pub zisk_data: String,
 }
 
+/// Payload for submitting a ZiSK SNARK proof.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct ZiskProofPayload {
+    pub batch_number: u64,
+    /// Base64-encoded ZiSK SNARK proof (768 bytes).
+    pub proof: String,
+    /// Base64-encoded ZiSK public values (256 bytes).
+    pub public_values: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct FailedProofResponse {
     pub batch_number: u64,

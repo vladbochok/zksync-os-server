@@ -369,6 +369,54 @@ pub(super) async fn peek_zisk_data(
     }
 }
 
+/// Pick the next ZiSK SNARK job. Assigns a batch to the requesting prover.
+/// Mirrors `/FRI/pick` in semantics: assignment with timeout-based reassignment.
+pub(super) async fn pick_zisk_job(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(ref zjm) = state.zisk_job_manager else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "ZiSK proving not enabled").into_response();
+    };
+
+    match zjm.pick_next_job(&query.id).await {
+        Some(job) => {
+            Json(ZiskBatchDataPayload {
+                batch_number: job.batch_number,
+                vk_hash: job.vk_hash,
+                zisk_data: general_purpose::STANDARD.encode(&job.zisk_data),
+            })
+            .into_response()
+        }
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+/// Submit a ZiSK SNARK proof. Pairs with the cached Airbender SNARK
+/// to produce a MultiProof for L1 verification.
+pub(super) async fn submit_zisk_proof(
+    Query(query): Query<ProverQuery>,
+    State(state): State<AppState>,
+    Json(payload): Json<super::models::ZiskProofPayload>,
+) -> Result<Response, (StatusCode, String)> {
+    let Some(ref zjm) = state.zisk_job_manager else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "ZiSK proving not enabled".into()));
+    };
+
+    let proof = general_purpose::STANDARD
+        .decode(&payload.proof)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid proof base64: {e}")))?;
+    let public_values = general_purpose::STANDARD
+        .decode(&payload.public_values)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid public_values base64: {e}")))?;
+
+    zjm.submit_proof(payload.batch_number, proof, public_values, &query.id)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// Get detailed information about a failed FRI proof for debugging.
 /// Returns the most recent failed proof for the given batch number.
 pub(super) async fn get_failed_fri_proof(

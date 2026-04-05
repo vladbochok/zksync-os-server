@@ -31,7 +31,7 @@ impl SnarkProvingPipelineStep {
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
-    ) -> (Self, Arc<SnarkJobManager>) {
+    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None)
     }
 
@@ -41,18 +41,29 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
         zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
-    ) -> (Self, Arc<SnarkJobManager>) {
+    ) -> (Self, Arc<SnarkJobManager>, Option<Arc<super::zisk_job_manager::ZiskJobManager>>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
         let mut sjm = SnarkJobManager::new(
-            proof_commands_sender,
+            proof_commands_sender.clone(),
             max_fris_per_snark,
             assignment_timeout,
             max_assigned_batch_range,
         );
-        if let Some(cache) = zisk_data_cache {
+
+        let zisk_job_manager = if let Some(cache) = zisk_data_cache {
             sjm.set_zisk_data_cache(cache);
-        }
+            let zjm = Arc::new(super::zisk_job_manager::ZiskJobManager::new(
+                proof_commands_sender,
+                assignment_timeout,
+            ));
+            sjm.set_zisk_job_manager(zjm.clone());
+            tracing::info!("ZiSK job manager enabled");
+            Some(zjm)
+        } else {
+            None
+        };
+
         let snark_job_manager = Arc::new(sjm);
 
         let result = Self {
@@ -61,7 +72,7 @@ impl SnarkProvingPipelineStep {
             proof_commands_receiver,
         };
 
-        (result, snark_job_manager)
+        (result, snark_job_manager, zisk_job_manager)
     }
 }
 
