@@ -1,20 +1,25 @@
 //! ZiSK SNARK proof generation.
 //!
 //! Runs the ZiSK pipeline (STARK aggregation → SNARK wrapping) as external
-//! subprocesses. Manages work directories and cleans up after completion.
+//! subprocesses managed by `cargo-zisk`. Work directories are cleaned up on
+//! success and preserved on failure for debugging.
+//!
+//! Follows the same patterns as `fri_proof_verifier.rs`:
+//! - Typed error enum with structured fields
+//! - Path validation at construction time (fail-fast)
+//! - Subprocess stderr captured for diagnostics
 
 use crate::config::ProverInputGeneratorConfig;
+use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-/// Expected proof output sizes (invariants of the ZiSK Plonk verifier).
-const ZISK_SNARK_PROOF_BYTES: usize = 768;
-const ZISK_PUBLIC_VALUES_BYTES: usize = 256;
-
 /// Validated ZiSK SNARK proof output.
 pub struct ZiskSnarkOutput {
+    /// 768-byte Plonk proof (24 BN254 points).
     pub proof: Vec<u8>,
+    /// 256-byte public values (8 uint256 slots; first 32 bytes = batch commitment).
     pub public_values: Vec<u8>,
 }
 
@@ -52,7 +57,13 @@ pub enum ZiskProverError {
     MissingOutput(PathBuf),
 }
 
-/// Validated configuration for ZiSK proving (all paths checked at construction).
+/// ZiSK prover with validated configuration.
+///
+/// All paths are checked at construction time via [`from_config`]. Proof
+/// generation creates a per-batch work directory that is cleaned up on
+/// success and preserved on failure for debugging.
+///
+/// [`from_config`]: ZiskProver::from_config
 #[derive(Clone)]
 pub struct ZiskProver {
     binary: PathBuf,
@@ -63,49 +74,22 @@ pub struct ZiskProver {
 }
 
 impl ZiskProver {
-    /// Create a prover from config, validating all paths exist.
+    /// Create a prover from config, validating that all required paths exist.
+    ///
+    /// Returns `Err` if any required field is `None` or points to a missing file.
+    /// Called at server startup to fail fast on misconfiguration.
     pub fn from_config(config: &ProverInputGeneratorConfig) -> Result<Self, ZiskProverError> {
-        let binary = config
-            .zisk_binary
-            .as_deref()
-            .ok_or(ZiskProverError::NotConfigured("zisk_binary"))?;
-        let elf_path = config
-            .zisk_elf_path
-            .as_deref()
-            .ok_or(ZiskProverError::NotConfigured("zisk_elf_path"))?;
-        let proving_key = config
-            .zisk_proving_key
-            .as_deref()
-            .ok_or(ZiskProverError::NotConfigured("zisk_proving_key"))?;
-        let proving_key_snark = config
-            .zisk_proving_key_snark
-            .as_deref()
-            .ok_or(ZiskProverError::NotConfigured("zisk_proving_key_snark"))?;
-        let work_dir_base = config
-            .zisk_work_dir
-            .as_deref()
-            .unwrap_or("/tmp/zisk_proofs");
-
-        // Validate paths exist at startup, not at proof time.
-        let binary = PathBuf::from(binary);
-        let elf_path = PathBuf::from(elf_path);
-        let proving_key = PathBuf::from(proving_key);
-        let proving_key_snark = PathBuf::from(proving_key_snark);
-        let work_dir_base = PathBuf::from(work_dir_base);
-
-        for (name, path) in [
-            ("binary", &binary),
-            ("elf_path", &elf_path),
-            ("proving_key", &proving_key),
-            ("proving_key_snark", &proving_key_snark),
-        ] {
-            if !path.exists() {
-                return Err(ZiskProverError::NotConfigured(
-                    // Leak a &'static str for the error message. This only happens at startup.
-                    Box::leak(format!("zisk.{name} path does not exist: {}", path.display()).into()),
-                ));
-            }
-        }
+        let binary = require_path(&config.zisk_binary, "zisk_binary")?;
+        let elf_path = require_path(&config.zisk_elf_path, "zisk_elf_path")?;
+        let proving_key = require_path(&config.zisk_proving_key, "zisk_proving_key")?;
+        let proving_key_snark =
+            require_path(&config.zisk_proving_key_snark, "zisk_proving_key_snark")?;
+        let work_dir_base = PathBuf::from(
+            config
+                .zisk_work_dir
+                .as_deref()
+                .unwrap_or("./db/zisk_proofs"),
+        );
 
         Ok(Self {
             binary,
@@ -118,8 +102,9 @@ impl ZiskProver {
 
     /// Generate a ZiSK SNARK proof for the given batch.
     ///
-    /// Runs STARK aggregation + SNARK wrapping as subprocesses.
-    /// Work directory is cleaned up on success.
+    /// Runs STARK aggregation followed by SNARK wrapping as subprocesses.
+    /// The work directory (`{work_dir_base}/batch_{batch_number}`) is cleaned
+    /// up on success and preserved on failure for debugging.
     pub fn generate_proof(
         &self,
         zisk_bincode: &[u8],
@@ -128,14 +113,14 @@ impl ZiskProver {
         let start = Instant::now();
         let work_dir = self.work_dir_base.join(format!("batch_{batch_number}"));
 
-        // Clean up any leftover from a previous attempt.
+        // Clean up leftover from a previous attempt.
         let _ = std::fs::remove_dir_all(&work_dir);
         std::fs::create_dir_all(&work_dir).map_err(|e| ZiskProverError::WorkDir {
             path: work_dir.clone(),
             source: e,
         })?;
 
-        let result = self.generate_proof_inner(zisk_bincode, batch_number, &work_dir);
+        let result = self.run_pipeline(zisk_bincode, batch_number, &work_dir);
 
         let elapsed = start.elapsed();
         match &result {
@@ -145,7 +130,6 @@ impl ZiskProver {
                     elapsed_secs = elapsed.as_secs(),
                     "ZiSK SNARK proof generated"
                 );
-                // Clean up work directory on success.
                 if let Err(e) = std::fs::remove_dir_all(&work_dir) {
                     tracing::warn!(
                         batch_number,
@@ -161,86 +145,33 @@ impl ZiskProver {
                     path = %work_dir.display(),
                     "ZiSK proof generation failed: {e}"
                 );
-                // Leave work directory for debugging on failure.
             }
         }
 
         result
     }
 
-    fn generate_proof_inner(
+    /// Internal pipeline: write input → STARK aggregation → SNARK wrapping → parse output.
+    fn run_pipeline(
         &self,
         zisk_bincode: &[u8],
         batch_number: u64,
         work_dir: &Path,
     ) -> Result<ZiskSnarkOutput, ZiskProverError> {
-        // Write input file.
         let input_path = work_dir.join("input.bin");
         write_zisk_input(&input_path, zisk_bincode)?;
 
-        // STARK aggregation.
         let stark_dir = work_dir.join("stark");
-        std::fs::create_dir_all(stark_dir.join("proofs")).map_err(|e| {
-            ZiskProverError::WorkDir {
-                path: stark_dir.clone(),
-                source: e,
-            }
-        })?;
-
-        tracing::info!(batch_number, "Running ZiSK STARK aggregation...");
-        run_subprocess(
-            &self.binary,
-            &[
-                "prove",
-                "-e",
-                self.elf_path.to_str().unwrap_or(""),
-                "-i",
-                input_path.to_str().unwrap_or(""),
-                "-k",
-                self.proving_key.to_str().unwrap_or(""),
-                "-o",
-                stark_dir.to_str().unwrap_or(""),
-                "--emulator",
-                "--aggregation",
-                "--save-proofs",
-                "-v",
-            ],
-            batch_number,
-            "STARK aggregation",
-        )?;
+        self.run_stark_aggregation(batch_number, &input_path, &stark_dir)?;
 
         let vadcop_path = stark_dir.join("vadcop_final_proof.bin");
         if !vadcop_path.exists() {
             return Err(ZiskProverError::MissingOutput(vadcop_path));
         }
 
-        // SNARK wrapping.
         let snark_dir = work_dir.join("snark");
-        std::fs::create_dir_all(&snark_dir).map_err(|e| ZiskProverError::WorkDir {
-            path: snark_dir.clone(),
-            source: e,
-        })?;
+        self.run_snark_wrapping(batch_number, &vadcop_path, &snark_dir)?;
 
-        tracing::info!(batch_number, "Running ZiSK SNARK wrapping...");
-        run_subprocess(
-            &self.binary,
-            &[
-                "prove-snark",
-                "--proof",
-                vadcop_path.to_str().unwrap_or(""),
-                "--elf",
-                self.elf_path.to_str().unwrap_or(""),
-                "--proving-key-snark",
-                self.proving_key_snark.to_str().unwrap_or(""),
-                "-o",
-                snark_dir.to_str().unwrap_or(""),
-                "-v",
-            ],
-            batch_number,
-            "SNARK wrapping",
-        )?;
-
-        // Parse output.
         let snark_proof_path = snark_dir.join("final_snark_proof.bin");
         if !snark_proof_path.exists() {
             return Err(ZiskProverError::MissingOutput(snark_proof_path));
@@ -248,9 +179,113 @@ impl ZiskProver {
 
         parse_snark_output(&snark_proof_path)
     }
+
+    /// Run `cargo-zisk prove` for STARK aggregation.
+    fn run_stark_aggregation(
+        &self,
+        batch_number: u64,
+        input_path: &Path,
+        stark_dir: &Path,
+    ) -> Result<(), ZiskProverError> {
+        std::fs::create_dir_all(stark_dir.join("proofs")).map_err(|e| {
+            ZiskProverError::WorkDir {
+                path: stark_dir.to_path_buf(),
+                source: e,
+            }
+        })?;
+
+        tracing::info!(batch_number, "Running ZiSK STARK aggregation...");
+        let output = Command::new(&self.binary)
+            .args([
+                "prove",
+                "-e", &path_str(&self.elf_path),
+                "-i", &path_str(input_path),
+                "-k", &path_str(&self.proving_key),
+                "-o", &path_str(stark_dir),
+                "--emulator", "--aggregation", "--save-proofs", "-v",
+            ])
+            .output()
+            .map_err(|e| ZiskProverError::StarkFailed {
+                batch: batch_number,
+                detail: format!("failed to spawn {}: {e}", self.binary.display()),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ZiskProverError::StarkFailed {
+                batch: batch_number,
+                detail: stderr_tail(&stderr),
+            });
+        }
+        Ok(())
+    }
+
+    /// Run `cargo-zisk prove-snark` for SNARK wrapping.
+    fn run_snark_wrapping(
+        &self,
+        batch_number: u64,
+        vadcop_path: &Path,
+        snark_dir: &Path,
+    ) -> Result<(), ZiskProverError> {
+        std::fs::create_dir_all(snark_dir).map_err(|e| ZiskProverError::WorkDir {
+            path: snark_dir.to_path_buf(),
+            source: e,
+        })?;
+
+        tracing::info!(batch_number, "Running ZiSK SNARK wrapping...");
+        let output = Command::new(&self.binary)
+            .args([
+                "prove-snark",
+                "--proof", &path_str(vadcop_path),
+                "--elf", &path_str(&self.elf_path),
+                "--proving-key-snark", &path_str(&self.proving_key_snark),
+                "-o", &path_str(snark_dir),
+                "-v",
+            ])
+            .output()
+            .map_err(|e| ZiskProverError::SnarkFailed {
+                batch: batch_number,
+                detail: format!("failed to spawn {}: {e}", self.binary.display()),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ZiskProverError::SnarkFailed {
+                batch: batch_number,
+                detail: stderr_tail(&stderr),
+            });
+        }
+        Ok(())
+    }
 }
 
-/// Write ZiSK stdin format: [len:u64_LE][bincode][padding_to_8B].
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Validate a config path exists, returning a PathBuf.
+fn require_path(opt: &Option<String>, field: &'static str) -> Result<PathBuf, ZiskProverError> {
+    let s = opt.as_deref().ok_or(ZiskProverError::NotConfigured(field))?;
+    let p = PathBuf::from(s);
+    if !p.exists() {
+        return Err(ZiskProverError::NotConfigured(Box::leak(
+            format!("{field} path does not exist: {}", p.display()).into_boxed_str(),
+        )));
+    }
+    Ok(p)
+}
+
+/// Convert Path to &str for command args (lossy on non-UTF8).
+fn path_str(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Return the last 1000 chars of stderr for error messages.
+fn stderr_tail(stderr: &str) -> String {
+    stderr[stderr.len().saturating_sub(1000)..].to_string()
+}
+
+/// Write ZiSK stdin format: `[len:u64_LE][bincode][padding_to_8B]`.
 fn write_zisk_input(path: &Path, bincode: &[u8]) -> Result<(), ZiskProverError> {
     let len = bincode.len() as u64;
     let mut buf = Vec::with_capacity(8 + bincode.len() + 8);
@@ -261,42 +296,9 @@ fn write_zisk_input(path: &Path, bincode: &[u8]) -> Result<(), ZiskProverError> 
     std::fs::write(path, &buf).map_err(ZiskProverError::WriteInput)
 }
 
-/// Run a cargo-zisk subprocess and check for success.
-fn run_subprocess(
-    binary: &Path,
-    args: &[&str],
-    batch_number: u64,
-    step_name: &str,
-) -> Result<(), ZiskProverError> {
-    let output = Command::new(binary)
-        .args(args)
-        .output()
-        .map_err(|e| ZiskProverError::StarkFailed {
-            batch: batch_number,
-            detail: format!("failed to spawn {}: {e}", binary.display()),
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = &stderr[stderr.len().saturating_sub(1000)..];
-        return Err(if step_name.contains("STARK") {
-            ZiskProverError::StarkFailed {
-                batch: batch_number,
-                detail: tail.to_string(),
-            }
-        } else {
-            ZiskProverError::SnarkFailed {
-                batch: batch_number,
-                detail: tail.to_string(),
-            }
-        });
-    }
-
-    Ok(())
-}
-
-/// Parse the ZiSK final_snark_proof.bin output format.
-/// Format: [proof_len:u64_LE][proof_bytes][pv_len:u64_LE][pv_bytes]
+/// Parse the ZiSK `final_snark_proof.bin` output.
+///
+/// Format: `[proof_len:u64_LE][proof_bytes][pv_len:u64_LE][pv_bytes]`
 fn parse_snark_output(path: &Path) -> Result<ZiskSnarkOutput, ZiskProverError> {
     let data = std::fs::read(path).map_err(|e| ZiskProverError::ReadOutput {
         path: path.to_path_buf(),
@@ -306,41 +308,36 @@ fn parse_snark_output(path: &Path) -> Result<ZiskSnarkOutput, ZiskProverError> {
     let min_size = 8 + ZISK_SNARK_PROOF_BYTES + 8 + ZISK_PUBLIC_VALUES_BYTES;
     if data.len() < min_size {
         return Err(ZiskProverError::InvalidOutput(format!(
-            "output file too small: {} bytes, expected at least {min_size}",
+            "file too small: {} bytes, expected >= {min_size}",
             data.len()
         )));
     }
 
-    let proof_len =
-        u64::from_le_bytes(data[0..8].try_into().map_err(|_| {
-            ZiskProverError::InvalidOutput("failed to read proof length".into())
-        })?) as usize;
-
+    let proof_len = u64::from_le_bytes(
+        data[0..8]
+            .try_into()
+            .map_err(|_| ZiskProverError::InvalidOutput("proof length header".into()))?,
+    ) as usize;
     if proof_len != ZISK_SNARK_PROOF_BYTES {
         return Err(ZiskProverError::InvalidOutput(format!(
             "proof length {proof_len}, expected {ZISK_SNARK_PROOF_BYTES}"
         )));
     }
 
-    let proof = data[8..8 + ZISK_SNARK_PROOF_BYTES].to_vec();
     let pv_offset = 8 + ZISK_SNARK_PROOF_BYTES;
-
     let pv_len = u64::from_le_bytes(
         data[pv_offset..pv_offset + 8]
             .try_into()
-            .map_err(|_| ZiskProverError::InvalidOutput("failed to read pv length".into()))?,
+            .map_err(|_| ZiskProverError::InvalidOutput("pv length header".into()))?,
     ) as usize;
-
     if pv_len != ZISK_PUBLIC_VALUES_BYTES {
         return Err(ZiskProverError::InvalidOutput(format!(
             "public values length {pv_len}, expected {ZISK_PUBLIC_VALUES_BYTES}"
         )));
     }
 
-    let public_values = data[pv_offset + 8..pv_offset + 8 + ZISK_PUBLIC_VALUES_BYTES].to_vec();
-
     Ok(ZiskSnarkOutput {
-        proof,
-        public_values,
+        proof: data[8..8 + ZISK_SNARK_PROOF_BYTES].to_vec(),
+        public_values: data[pv_offset + 8..pv_offset + 8 + ZISK_PUBLIC_VALUES_BYTES].to_vec(),
     })
 }

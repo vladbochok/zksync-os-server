@@ -194,74 +194,39 @@ impl ProofCommand {
                 .collect()
             }
             SnarkProof::MultiProof(multi_proof) => {
-                // Validate proof sizes (invariants from MultiProofSnarkProof construction).
-                assert_eq!(
-                    multi_proof.zisk_proof.len(), 768,
-                    "ZiSK proof must be exactly 768 bytes, got {}",
-                    multi_proof.zisk_proof.len()
-                );
-                assert_eq!(
-                    multi_proof.zisk_public_values.len(), 256,
-                    "ZiSK public values must be exactly 256 bytes, got {}",
-                    multi_proof.zisk_public_values.len()
-                );
-                assert!(
-                    multi_proof.era_proof.len() % 32 == 0,
-                    "Era proof must be a multiple of 32 bytes, got {}",
-                    multi_proof.era_proof.len()
-                );
+                // Structural validation (defensive — sizes are set by ZiskProver).
+                debug_assert_eq!(multi_proof.zisk_proof.len(), 768);
+                debug_assert_eq!(multi_proof.zisk_public_values.len(), 256);
+                debug_assert!(multi_proof.era_proof.len() % 32 == 0);
 
                 // Cross-proof validation: both proof systems must commit to the same batch.
                 let zisk_commitment =
                     B256::from_slice(&multi_proof.zisk_public_values[..32]);
-                let first_batch_input = Self::get_batch_public_input(
+                let era_commitment = Self::get_batch_public_input(
                     previous_batch_info,
-                    stored_batch_infos
-                        .first()
-                        .expect("stored_batch_infos must not be empty"),
+                    &stored_batch_infos[0],
                 );
                 assert_eq!(
-                    zisk_commitment, first_batch_input,
-                    "ZiSK batch commitment {zisk_commitment} does not match \
-                     Era batch commitment {first_batch_input}"
+                    zisk_commitment, era_commitment,
+                    "batch commitment mismatch: ZiSK={zisk_commitment}, Airbender={era_commitment}"
                 );
                 tracing::info!("Cross-proof validation passed: commitments match");
 
-                // Era (Airbender) SNARK proof as U256 chunks
-                let era_chunks: Vec<U256> = multi_proof
-                    .era_proof
-                    .chunks(32)
-                    .map(|chunk| {
-                        let arr: [u8; 32] = chunk
-                            .try_into()
-                            .expect("era proof bytes must be a multiple of 32");
-                        U256::from_be_bytes(arr)
-                    })
-                    .collect();
+                // Convert byte arrays to U256 chunks for L1 calldata encoding.
+                // Safety: sizes validated by debug_assert above.
+                let to_u256_chunks = |bytes: &[u8]| -> Vec<U256> {
+                    bytes
+                        .chunks_exact(32)
+                        .map(|c| {
+                            let arr: [u8; 32] = c.try_into().unwrap();
+                            U256::from_be_bytes(arr)
+                        })
+                        .collect()
+                };
 
-                // ZiSK SNARK proof as U256 chunks (always 24 elements = 768 bytes)
-                let zisk_proof_chunks: Vec<U256> = multi_proof
-                    .zisk_proof
-                    .chunks(32)
-                    .map(|chunk| {
-                        let arr: [u8; 32] = chunk
-                            .try_into()
-                            .expect("zisk proof must be 768 bytes (24 * 32)");
-                        U256::from_be_bytes(arr)
-                    })
-                    .collect();
-
-                // ZiSK public values as U256 chunks (always 8 elements = 256 bytes)
-                let zisk_pv_chunks: Vec<U256> = multi_proof
-                    .zisk_public_values
-                    .chunks(32)
-                    .map(|chunk| {
-                        let arr: [u8; 32] = chunk
-                            .try_into()
-                            .expect("zisk public values must be 256 bytes (8 * 32)");
-                        U256::from_be_bytes(arr)
-                    })
-                    .collect();
+                let era_chunks = to_u256_chunks(&multi_proof.era_proof);
+                let zisk_proof_chunks = to_u256_chunks(&multi_proof.zisk_proof);
+                let zisk_pv_chunks = to_u256_chunks(&multi_proof.zisk_public_values);
 
                 // Multi-proof encoding (MULTI_PROOF_TYPE = 5).
                 // The MultiProofVerifier requires BOTH proofs to pass.

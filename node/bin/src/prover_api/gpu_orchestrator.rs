@@ -15,11 +15,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 
-/// Shared GPU coordination state.
+/// Shared GPU coordination state between the Airbender prover orchestrator
+/// and the ZiSK `MultiProofCombiner`.
+///
+/// State machine:
+/// ```text
+/// [Airbender running] → prover_stopped() → [GPU free]
+///     → acquire_gpu_for_zisk() → [ZiSK running]
+///     → release_gpu_from_zisk() → [GPU free]
+///     → wait_for_zisk_done() → [Airbender starts]
+/// ```
 pub struct GpuCoordinator {
+    /// True when the Airbender prover process is active.
     prover_running: Mutex<bool>,
+    /// Signaled when the prover exits (GPU becomes available).
     gpu_available: Notify,
+    /// Signaled when ZiSK finishes (GPU available for Airbender restart).
     zisk_done: Notify,
+    /// True when ZiSK is generating proofs on GPU.
     zisk_pending: Mutex<bool>,
 }
 

@@ -115,12 +115,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             }
         }
         // Pre-create the proxy implementation target.
-        // Read the ERC1967 implementation slot from 0x800f's storage.
-        let proxy_addr: Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
+        // The ComplexUpgrader at 0x800f delegates to an implementation via ERC1967 slot.
+        use crate::prover_api::zisk_proof_constants::{COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT};
+        let proxy_addr: Address = COMPLEX_UPGRADER_ADDRESS.parse().expect("invalid upgrader address constant");
         let impl_slot = U256::from_be_bytes(
-            B256::from_slice(&alloy::primitives::hex::decode(
-                "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
-            ).unwrap()).0
+            B256::from_slice(&alloy::primitives::hex::decode(ERC1967_IMPLEMENTATION_SLOT)
+                .expect("invalid ERC1967 slot constant")).0
         );
         let impl_flat_key = zisk_merkle::derive_flat_storage_key(
             &proxy_addr.into_array(),
@@ -245,17 +245,16 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         }
     }
     // For upgrade txs: add the proxy's implementation slot read to the proof set.
-    // The upgrade tx at 0x800f reads the ERC1967 implementation slot which the
-    // ZiSK executor needs a merkle proof for.
+    // The upgrade tx reads the ComplexUpgrader's ERC1967 implementation slot.
+    // The ZiSK executor needs a merkle proof for this read.
     if has_upgrade {
-        let proxy_addr: Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
-        let impl_slot = B256::from_slice(&alloy::primitives::hex::decode(
-            "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
-        ).unwrap());
-        let flat_key = zisk_merkle::derive_flat_storage_key(
-            &proxy_addr.into_array(),
-            &impl_slot,
+        use crate::prover_api::zisk_proof_constants::{COMPLEX_UPGRADER_ADDRESS, ERC1967_IMPLEMENTATION_SLOT};
+        let proxy_addr: Address = COMPLEX_UPGRADER_ADDRESS.parse().expect("invalid upgrader address constant");
+        let impl_slot = B256::from_slice(
+            &alloy::primitives::hex::decode(ERC1967_IMPLEMENTATION_SLOT)
+                .expect("invalid ERC1967 slot constant"),
         );
+        let flat_key = zisk_merkle::derive_flat_storage_key(&proxy_addr.into_array(), &impl_slot);
         all_storage_read_keys.insert(flat_key);
     }
 

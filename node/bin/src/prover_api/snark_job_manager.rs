@@ -17,7 +17,11 @@ use zksync_os_observability::{
 };
 use zksync_os_types::ProvingVersion;
 
-/// Cached Airbender SNARK proof waiting for ZiSK SNARK to be generated.
+/// Airbender SNARK proof cached while waiting for ZiSK SNARK generation.
+///
+/// Created by `submit_proof` when ZiSK data exists for the batch.
+/// Consumed by `MultiProofCombiner` after ZiSK SNARK is generated.
+/// Re-inserted on ZiSK failure to allow retry.
 struct PendingMultiProof {
     era_proof: Vec<u8>,
     proving_version: u32,
@@ -69,6 +73,8 @@ impl SnarkJobManager {
         self.fri_job_manager = Some(fjm);
     }
 
+    /// Adds a pending job to the SNARK proving queue.
+    /// Awaits if queue is full (ProverJobMap.max_assigned_batch_range).
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<FriProof>) {
         self.jobs.add_job(batch_envelope).await
     }
@@ -125,7 +131,7 @@ impl SnarkJobManager {
         );
 
         let has_zisk = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.peek_zisk_data(batch_from).await
+            fjm.contains_zisk_data(batch_from).await
         } else {
             false
         };
@@ -188,7 +194,7 @@ impl SnarkJobManager {
 
         // Clone ZiSK data (preserve original for retry).
         let zisk_bincode = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.clone_zisk_data(batch_num).await
+            fjm.get_zisk_data(batch_num).await
         } else {
             None
         };
@@ -219,7 +225,7 @@ impl SnarkJobManager {
             Ok(output) => {
                 // Success — remove ZiSK data from cache.
                 if let Some(ref fjm) = self.fri_job_manager {
-                    fjm.take_zisk_data(batch_num).await;
+                    fjm.remove_zisk_data(batch_num).await;
                 }
 
                 tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");

@@ -138,18 +138,21 @@ impl FriJobManager {
         self.jobs.add_job(batch_envelope).await
     }
 
-    /// Take cached ZiSK data for the given batch, removing it from the cache.
-    pub async fn take_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
+    /// Remove and return cached ZiSK data for the given batch.
+    /// Called after successful ZiSK SNARK generation to free memory.
+    pub async fn remove_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
         self.zisk_data_cache.lock().await.remove(&batch_number)
     }
 
-    /// Check whether ZiSK data exists for the given batch (without removing it).
-    pub async fn peek_zisk_data(&self, batch_number: u64) -> bool {
+    /// Check whether ZiSK data exists for the given batch without consuming it.
+    /// Used by `submit_proof` to decide whether to cache the Airbender SNARK.
+    pub async fn contains_zisk_data(&self, batch_number: u64) -> bool {
         self.zisk_data_cache.lock().await.contains_key(&batch_number)
     }
 
-    /// Clone cached ZiSK data for the given batch (without removing it).
-    pub async fn clone_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
+    /// Clone cached ZiSK data for the given batch without consuming it.
+    /// Used by `MultiProofCombiner` so the data survives retry on failure.
+    pub async fn get_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
         self.zisk_data_cache.lock().await.get(&batch_number).cloned()
     }
 
