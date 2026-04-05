@@ -173,12 +173,11 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let mut all_storage_read_keys = HashSet::new();
     let mut all_storage_reads: Vec<(Address, U256, U256)> = Vec::new();
 
-    // Skip pre-execution for upgrade/system transactions — their writes are
-    // bootloader-level flat storage operations that REVM can't reproduce.
-    // Pre-execution is only useful for user transactions where REVM traces
-    // the full EVM call chain.
-    let skip_pre_execution = has_upgrade;
-    let max_iterations = if skip_pre_execution { 0 } else { 1 };
+    // Run pre-execution even for upgrade blocks to discover storage reads.
+    // The REVM execution may fail or produce incorrect writes for upgrade txs
+    // (since bootloader-level operations aren't reproduced), but the storage
+    // reads discovered are needed for merkle proofs.
+    let max_iterations = 1;
 
     for iteration in 0..max_iterations {
         let state_view_for_pre = read_state.state_view_at(block_number - 1)?;
@@ -245,6 +244,21 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             break;
         }
     }
+    // For upgrade txs: add the proxy's implementation slot read to the proof set.
+    // The upgrade tx at 0x800f reads the ERC1967 implementation slot which the
+    // ZiSK executor needs a merkle proof for.
+    if has_upgrade {
+        let proxy_addr: Address = "0x000000000000000000000000000000000000800f".parse().unwrap();
+        let impl_slot = B256::from_slice(&alloy::primitives::hex::decode(
+            "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+        ).unwrap());
+        let flat_key = zisk_merkle::derive_flat_storage_key(
+            &proxy_addr.into_array(),
+            &impl_slot,
+        );
+        all_storage_read_keys.insert(flat_key);
+    }
+
     let mut state_view = read_state.state_view_at(block_number - 1)?;
     let storage_read_keys = all_storage_read_keys;
     let storage_reads = all_storage_reads;
