@@ -1053,7 +1053,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         let obs_hash = B256::from(props.observable_bytecode_hash.as_u8_array());
         let pre_hash = B256::from(props.bytecode_hash.as_u8_array());
         let effective = if obs_hash.is_zero() { KECCAK_EMPTY } else { obs_hash };
-        tracing::info!("Pre-creating upgrade implementation at {impl_addr} code_hash={effective}");
+        tracing::info!(address = %impl_addr, code_hash = %effective, "pre-creating upgrade implementation");
         accounts_map.insert(impl_addr, AccountInfo {
             nonce: props.nonce, balance: props.balance, code_hash: effective,
             code: None, account_id: None,
@@ -1076,7 +1076,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
             }
         }
     } else {
-        tracing::info!("Pre-creating empty upgrade implementation at {impl_addr}");
+        tracing::info!(address = %impl_addr, "pre-creating empty upgrade implementation");
         accounts_map.insert(impl_addr, AccountInfo {
             nonce: 1, balance: U256::ZERO, code_hash: KECCAK_EMPTY,
             code: None, account_id: None,

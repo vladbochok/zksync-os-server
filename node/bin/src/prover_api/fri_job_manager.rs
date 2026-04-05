@@ -95,7 +95,7 @@ pub struct FriJobManager {
     // == storage ==
     proof_storage: ProofStorage,
     /// Cache of ZiSK batch data (bincode-serialized BatchInput) by batch number.
-    /// Saved when batches enter the queue, consumed when composing two-proof-system proofs.
+    /// Saved when batches enter the queue, consumed when composing multi-proof proofs.
     zisk_data_cache: Mutex<HashMap<u64, Vec<u8>>>,
     // == metrics ==
     latency_tracker: ComponentStateHandle<GenericComponentState>,
@@ -128,11 +128,11 @@ impl FriJobManager {
 
     /// Adds a pending job to the queue.
     /// Awaits if the queue is full (ProverJobMap.max_assigned_batch_range).
-    /// If the ProverInput carries ZiSK data, it's cached for later two-proof-system composition.
+    /// If the ProverInput carries ZiSK data, it's cached for later multi-proof composition.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
         if let Some(zisk_bytes) = batch_envelope.data.zisk_data() {
             let batch_number = batch_envelope.batch_number();
-            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "Caching ZiSK data for two-proof-system");
+            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "Caching ZiSK data for multi-proof");
             self.zisk_data_cache.lock().await.insert(batch_number, zisk_bytes.to_vec());
         }
         self.jobs.add_job(batch_envelope).await

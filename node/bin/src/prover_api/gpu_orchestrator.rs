@@ -72,7 +72,7 @@ impl GpuCoordinator {
             {
                 Ok(()) => {} // Notified — recheck.
                 Err(_) => {
-                    tracing::warn!("MultiProofCombiner: still waiting for GPU (Airbender prover running)");
+                    tracing::warn!("still waiting for GPU (Airbender prover running)");
                 }
             }
         }
@@ -147,14 +147,21 @@ impl GpuProverOrchestrator {
 
             match result {
                 Ok(0) => {
-                    tracing::info!("Airbender prover completed successfully");
+                    tracing::info!("Airbender GPU prover round completed");
                 }
                 Ok(code) => {
-                    tracing::warn!(exit_code = code, "Airbender prover exited with error, retrying in 10s");
+                    tracing::warn!(
+                        exit_code = code,
+                        retry_delay_secs = PROVER_RETRY_DELAY_SECS,
+                        "Airbender GPU prover exited with error"
+                    );
                     tokio::time::sleep(Duration::from_secs(PROVER_RETRY_DELAY_SECS)).await;
                 }
                 Err(e) => {
-                    tracing::error!("Airbender prover failed: {e:#}, retrying in 10s");
+                    tracing::error!(
+                        retry_delay_secs = PROVER_RETRY_DELAY_SECS,
+                        "Airbender GPU prover failed: {e:#}"
+                    );
                     tokio::time::sleep(Duration::from_secs(PROVER_RETRY_DELAY_SECS)).await;
                 }
             }

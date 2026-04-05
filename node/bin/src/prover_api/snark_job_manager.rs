@@ -228,7 +228,12 @@ impl SnarkJobManager {
                     fjm.remove_zisk_data(batch_num).await;
                 }
 
-                tracing::info!(batch = batch_num, "Combined Airbender + ZiSK multi-proof ready");
+                tracing::info!(
+                    batch = batch_num,
+                    era_proof_bytes = pending.era_proof.len(),
+                    zisk_proof_bytes = output.proof.len(),
+                    "combined Airbender + ZiSK multi-proof ready"
+                );
                 let snark_proof = SnarkProof::MultiProof(MultiProofSnarkProof {
                     era_proof: pending.era_proof,
                     zisk_proof: output.proof,
@@ -395,9 +400,9 @@ impl MultiProofCombiner {
 
             // Acquire GPU if coordinator is present (waits for Airbender to exit).
             if let Some(ref coord) = self.gpu_coordinator {
-                tracing::info!("MultiProofCombiner: waiting for GPU");
+                tracing::info!("waiting for GPU (Airbender prover to exit)");
                 coord.acquire_gpu_for_zisk().await;
-                tracing::info!("MultiProofCombiner: GPU acquired");
+                tracing::info!("GPU acquired, starting ZiSK proof generation");
             }
 
             // Process all pending proofs while we hold the GPU.
@@ -410,7 +415,10 @@ impl MultiProofCombiner {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(e) => {
-                        tracing::error!("MultiProofCombiner error (retry in {:?}): {e:#}", self.retry_delay);
+                        tracing::error!(
+                            retry_delay_secs = self.retry_delay.as_secs(),
+                            "ZiSK proof generation failed, will retry: {e:#}"
+                        );
                         break;
                     }
                 }
@@ -419,7 +427,7 @@ impl MultiProofCombiner {
             // Release GPU.
             if let Some(ref coord) = self.gpu_coordinator {
                 coord.release_gpu_from_zisk().await;
-                tracing::info!("MultiProofCombiner: GPU released");
+                tracing::info!("GPU released for Airbender prover");
             }
         }
     }
