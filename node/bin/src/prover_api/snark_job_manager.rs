@@ -189,7 +189,7 @@ impl SnarkJobManager {
             let Some(&batch_num) = map.keys().next() else {
                 return Ok(false);
             };
-            // Remove to prevent concurrent processing. Re-insert on failure.
+            // Safe: batch_num was just returned by keys().next() on the same lock scope.
             let pending = map.remove(&batch_num).unwrap();
             (batch_num, pending)
         };

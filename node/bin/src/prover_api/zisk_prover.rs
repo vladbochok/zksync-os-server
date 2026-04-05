@@ -96,7 +96,7 @@ impl ZiskProver {
             config
                 .work_dir
                 .as_deref()
-                .unwrap_or("./db/zisk_proofs"),
+                .unwrap_or(crate::prover_api::zisk_data_cache::DEFAULT_ZISK_WORK_DIR),
         );
 
         Ok(Self {

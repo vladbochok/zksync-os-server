@@ -20,6 +20,9 @@ pub struct ZiskDataCache {
     inner: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
+/// Default work directory for ZiSK proof intermediate files.
+pub(crate) const DEFAULT_ZISK_WORK_DIR: &str = "./db/zisk_proofs";
+
 impl ZiskDataCache {
     pub fn new() -> Self {
         Self {

@@ -194,10 +194,12 @@ impl ProofCommand {
                 .collect()
             }
             SnarkProof::MultiProof(multi_proof) => {
-                // Structural validation (defensive — sizes are set by ZiskProver).
-                debug_assert_eq!(multi_proof.zisk_proof.len(), 768);
-                debug_assert_eq!(multi_proof.zisk_public_values.len(), 256);
-                debug_assert!(multi_proof.era_proof.len() % 32 == 0);
+                // Structural validation — must hold in release builds to prevent
+                // invalid L1 calldata. Sizes are set by ZiskProver but verified here
+                // as a defense-in-depth invariant.
+                assert_eq!(multi_proof.zisk_proof.len(), 768);
+                assert_eq!(multi_proof.zisk_public_values.len(), 256);
+                assert_eq!(multi_proof.era_proof.len() % 32, 0);
 
                 // Cross-proof validation: both proof systems must commit to the same batch.
                 let zisk_commitment =

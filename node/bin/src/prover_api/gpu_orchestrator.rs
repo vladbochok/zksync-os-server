@@ -101,11 +101,12 @@ impl GpuProverOrchestrator {
             .app_bin_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("gpu_prover_app_bin not configured"))?;
+        const DEFAULT_PROVER_OUTPUT_DIR: &str = "./db/prover_output";
         let output_dir = self
             .config
             .output_dir
             .as_deref()
-            .unwrap_or("./db/prover_output");
+            .unwrap_or(DEFAULT_PROVER_OUTPUT_DIR);
 
         let _ = std::fs::create_dir_all(output_dir);
 
