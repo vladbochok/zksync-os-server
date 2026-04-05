@@ -889,6 +889,17 @@ pub struct ProverInputGeneratorConfig {
     /// Implies `second_proof_system = true`.
     #[config(default_t = false)]
     pub multi_proof_verifier: bool,
+
+    /// Path to the Airbender GPU prover binary. When set, the server manages the
+    /// prover process lifecycle for GPU sharing: Airbender runs first (GPU), then
+    /// ZiSK runs (GPU), in alternating rounds. Implies `second_proof_system = true`.
+    pub gpu_prover_binary: Option<String>,
+
+    /// Path to the trusted setup CRS file for the Airbender SNARK prover.
+    pub gpu_prover_crs_file: Option<String>,
+
+    /// Path to the ZKsync OS app binary for the Airbender prover.
+    pub gpu_prover_app_bin: Option<String>,
 }
 
 /// Only used on the Main Node.

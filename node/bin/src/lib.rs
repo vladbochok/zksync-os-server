@@ -1041,11 +1041,43 @@ async fn run_main_node_pipeline(
         run_fake_snark_provers(&config.prover_api_config, runtime, snark_job_manager.clone());
     }
 
-    // Spawn the MultiProofCombiner to asynchronously generate ZiSK SNARK proofs
-    // and combine them with Airbender SNARKs that were cached by submit_proof().
+    // Spawn the MultiProofCombiner and optional GPU Prover Orchestrator.
     if config.prover_input_generator_config.second_proof_system {
+        let gpu_coordinator = if let (Some(prover_binary), Some(crs_file), Some(app_bin)) = (
+            &config.prover_input_generator_config.gpu_prover_binary,
+            &config.prover_input_generator_config.gpu_prover_crs_file,
+            &config.prover_input_generator_config.gpu_prover_app_bin,
+        ) {
+            // GPU orchestrator mode: manage Airbender prover process lifecycle
+            // for GPU sharing with ZiSK.
+            let coord =
+                crate::prover_api::gpu_orchestrator::GpuCoordinator::new();
+            let orchestrator =
+                crate::prover_api::gpu_orchestrator::GpuProverOrchestrator::new(
+                    crate::prover_api::gpu_orchestrator::AirbenderProverConfig {
+                        prover_binary: prover_binary.clone(),
+                        sequencer_url: format!(
+                            "http://localhost:{}",
+                            config.prover_api_config.address.split(':').last().unwrap_or("3124")
+                        ),
+                        output_dir: "/tmp/prover_output".to_string(),
+                        trusted_setup_file: crs_file.clone(),
+                        app_bin_path: app_bin.clone(),
+                        max_fris_per_snark: config.prover_api_config.max_fris_per_snark as u32,
+                        iterations_per_round: 1,
+                    },
+                    coord.clone(),
+                );
+            runtime.spawn_critical_task("gpu_prover_orchestrator", orchestrator.run());
+            tracing::info!("GPU prover orchestrator enabled: Airbender and ZiSK share GPU sequentially");
+            Some(coord)
+        } else {
+            None
+        };
+
         let combiner = crate::prover_api::snark_job_manager::MultiProofCombiner::new(
             snark_job_manager,
+            gpu_coordinator,
         );
         runtime.spawn_critical_task("multi_proof_combiner", combiner.run());
     }

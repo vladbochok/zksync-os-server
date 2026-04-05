@@ -306,8 +306,13 @@ pub struct FakeSnarkProver {
 
 /// Background task that generates ZiSK SNARK proofs and combines them
 /// with cached Airbender SNARKs into MultiProofs.
+///
+/// When `gpu_coordinator` is set, acquires the GPU lock before running
+/// ZiSK and releases it after, enabling sequential GPU sharing with
+/// the Airbender prover.
 pub struct MultiProofCombiner {
     job_manager: Arc<SnarkJobManager>,
+    gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
     polling_interval: Duration,
 }
 
@@ -435,28 +440,56 @@ impl FakeSnarkProver {
 }
 
 impl MultiProofCombiner {
-    pub fn new(job_manager: Arc<SnarkJobManager>) -> Self {
+    pub fn new(
+        job_manager: Arc<SnarkJobManager>,
+        gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
+    ) -> Self {
         Self {
             job_manager,
+            gpu_coordinator,
             polling_interval: Duration::from_millis(POLL_INTERVAL_MS),
         }
     }
 
     pub async fn run(self) {
         loop {
-            match self.job_manager.process_one_pending_multi_proof().await {
-                Ok(true) => {
-                    // Processed one — check for more immediately.
-                    continue;
+            // Check if there's a pending proof before acquiring GPU.
+            let has_pending = !self
+                .job_manager
+                .pending_multi_proofs
+                .lock()
+                .await
+                .is_empty();
+
+            if !has_pending {
+                tokio::time::sleep(self.polling_interval).await;
+                continue;
+            }
+
+            // Acquire GPU if coordinator is present (waits for Airbender to exit).
+            if let Some(ref coord) = self.gpu_coordinator {
+                tracing::info!("MultiProofCombiner: waiting for GPU (Airbender prover to exit)...");
+                coord.acquire_gpu_for_zisk().await;
+                tracing::info!("MultiProofCombiner: GPU acquired, starting ZiSK");
+            }
+
+            // Process all pending proofs while we hold the GPU.
+            loop {
+                match self.job_manager.process_one_pending_multi_proof().await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        tracing::error!("MultiProofCombiner error: {e:#}");
+                        // Don't retry immediately — release GPU first.
+                        break;
+                    }
                 }
-                Ok(false) => {
-                    // Nothing pending — sleep before polling again.
-                    tokio::time::sleep(self.polling_interval).await;
-                }
-                Err(e) => {
-                    tracing::error!("MultiProofCombiner error (will retry in 60s): {e:#}");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                }
+            }
+
+            // Release GPU so the orchestrator can restart the Airbender prover.
+            if let Some(ref coord) = self.gpu_coordinator {
+                coord.release_gpu_from_zisk().await;
+                tracing::info!("MultiProofCombiner: GPU released");
             }
         }
     }
