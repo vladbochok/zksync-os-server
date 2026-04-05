@@ -325,6 +325,8 @@ impl SnarkJobManager {
 }
 
 const POLL_INTERVAL_MS: u64 = 1000;
+/// Delay between ZiSK proof generation retries on failure.
+const ZISK_RETRY_DELAY_SECS: u64 = 60;
 
 pub struct FakeSnarkProver {
     job_manager: Arc<SnarkJobManager>,
@@ -380,7 +382,7 @@ impl MultiProofCombiner {
             zisk_prover,
             gpu_coordinator,
             polling_interval: Duration::from_millis(POLL_INTERVAL_MS),
-            retry_delay: Duration::from_secs(60),
+            retry_delay: Duration::from_secs(ZISK_RETRY_DELAY_SECS),
         }
     }
 

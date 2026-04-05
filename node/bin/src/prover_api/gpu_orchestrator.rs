@@ -55,13 +55,26 @@ impl GpuCoordinator {
         self.gpu_available.notify_waiters();
     }
 
+    /// Wait for the Airbender prover to exit, then claim GPU for ZiSK.
+    /// Logs a warning every 60s while waiting.
     pub async fn acquire_gpu_for_zisk(&self) {
         loop {
             if !*self.prover_running.lock().await {
                 *self.zisk_pending.lock().await = true;
                 return;
             }
-            self.gpu_available.notified().await;
+            // Wait with periodic logging so operators know we're blocked.
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                self.gpu_available.notified(),
+            )
+            .await
+            {
+                Ok(()) => {} // Notified — recheck.
+                Err(_) => {
+                    tracing::warn!("MultiProofCombiner: still waiting for GPU (Airbender prover running)");
+                }
+            }
         }
     }
 
@@ -89,6 +102,11 @@ pub struct AirbenderGpuConfig {
     pub process_timeout_secs: u64,
     pub iterations_per_round: u32,
 }
+
+/// Delay between prover restart attempts on failure (seconds).
+const PROVER_RETRY_DELAY_SECS: u64 = 10;
+/// Brief pause after prover exits to let ZiSK claim GPU.
+const GPU_HANDOFF_DELAY_SECS: u64 = 2;
 
 /// Background task that manages the Airbender prover process lifecycle.
 pub struct GpuProverOrchestrator {
@@ -133,16 +151,16 @@ impl GpuProverOrchestrator {
                 }
                 Ok(code) => {
                     tracing::warn!(exit_code = code, "Airbender prover exited with error, retrying in 10s");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(Duration::from_secs(PROVER_RETRY_DELAY_SECS)).await;
                 }
                 Err(e) => {
                     tracing::error!("Airbender prover failed: {e:#}, retrying in 10s");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(Duration::from_secs(PROVER_RETRY_DELAY_SECS)).await;
                 }
             }
 
             // Brief pause to let ZiSK claim GPU if needed.
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(GPU_HANDOFF_DELAY_SECS)).await;
         }
     }
 

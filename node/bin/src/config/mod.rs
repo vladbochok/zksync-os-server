@@ -878,9 +878,10 @@ pub struct ProverInputGeneratorConfig {
     #[config(default_t = true)]
     pub enable_input_generation: bool,
 
-    /// When true, generate a second proof system's input alongside the
-    /// primary airbender witness. Currently this is ZiSK (RV64IMA).
-    /// The two proofs run in parallel — the primary is always airbender.
+    /// Enable ZiSK (RV64IMA) proof generation alongside Airbender.
+    /// When true, generates ZiSK prover input for every batch and the
+    /// `MultiProofCombiner` combines both proofs for L1 verification.
+    /// Requires `zisk_*` paths to be configured below.
     #[config(default_t = false)]
     pub second_proof_system: bool,
 
