@@ -311,7 +311,8 @@ pub struct MultiProofCombiner {
     polling_interval: Duration,
 }
 
-/// Generate a real ZiSK SNARK proof by running the full pipeline.
+/// Generate a real ZiSK SNARK proof by running the full GPU-accelerated pipeline.
+/// Uses `cargo-zisk prove --snark` for combined STARK aggregation + SNARK wrapping.
 /// Returns (snark_proof_bytes[768], public_values[256]).
 fn generate_zisk_snark_proof(
     zisk_bincode: &[u8],
@@ -343,61 +344,45 @@ fn generate_zisk_snark_proof(
         std::fs::write(&input_path, &buf).map_err(|e| format!("write input: {e}"))?;
     }
 
-    // STARK aggregation
-    let stark_dir = format!("{work_dir}/stark");
-    let _ = std::fs::create_dir_all(format!("{stark_dir}/proofs"));
-    tracing::info!(batch_number, "Running ZiSK STARK aggregation...");
-    let stark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
+    // Combined STARK + SNARK pipeline (GPU-accelerated)
+    let output_dir = format!("{work_dir}/stark");
+    let _ = std::fs::create_dir_all(format!("{output_dir}/proofs"));
+    tracing::info!(batch_number, "Running ZiSK GPU prove (STARK + SNARK)...");
+    let output = Command::new(format!("{zisk_bin}/cargo-zisk"))
         .args([
-            "prove", "-e", &elf_path, "-i", &input_path, "-k", &proving_key, "-o", &stark_dir,
-            "--emulator", "--aggregation", "--save-proofs", "-v",
-        ])
-        .output()
-        .map_err(|e| format!("cargo-zisk prove: {e}"))?;
-    if !stark_output.status.success() {
-        let stderr = String::from_utf8_lossy(&stark_output.stderr);
-        return Err(format!(
-            "STARK aggregation failed: {}",
-            &stderr[stderr.len().saturating_sub(500)..]
-        ));
-    }
-    let vadcop_path = format!("{stark_dir}/vadcop_final_proof.bin");
-    if !std::path::Path::new(&vadcop_path).exists() {
-        return Err("vadcop_final_proof.bin not generated".into());
-    }
-
-    // SNARK wrapping
-    let snark_dir = format!("{work_dir}/snark");
-    let _ = std::fs::create_dir_all(&snark_dir);
-    tracing::info!(batch_number, "Running ZiSK SNARK wrapping...");
-    let snark_output = Command::new(format!("{zisk_bin}/cargo-zisk"))
-        .args([
-            "prove-snark",
-            "--proof",
-            &vadcop_path,
-            "--elf",
+            "prove",
+            "-e",
             &elf_path,
-            "--proving-key-snark",
+            "-i",
+            &input_path,
+            "-k",
+            &proving_key,
+            "-w",
             &snark_key,
             "-o",
-            &snark_dir,
+            &output_dir,
+            "--emulator",
+            "--aggregation",
+            "--snark",
             "-v",
         ])
         .output()
-        .map_err(|e| format!("cargo-zisk prove-snark: {e}"))?;
-    if !snark_output.status.success() {
-        let stderr = String::from_utf8_lossy(&snark_output.stderr);
+        .map_err(|e| format!("cargo-zisk prove --snark: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
-            "SNARK wrapping failed: {}",
-            &stderr[stderr.len().saturating_sub(500)..]
+            "ZiSK prove --snark failed: {}",
+            &stderr[stderr.len().saturating_sub(1000)..]
         ));
     }
-    let snark_proof_path = format!("{snark_dir}/final_snark_proof.bin");
+
+    // Find the SNARK proof output
+    let snark_proof_path = format!("{output_dir}/final_snark_proof.bin");
     if !std::path::Path::new(&snark_proof_path).exists() {
         return Err("final_snark_proof.bin not generated".into());
     }
 
-    // Parse output
+    // Parse output: [proof_len:u64_LE][proof_bytes][pv_len:u64_LE][pv_bytes]
     let data = std::fs::read(&snark_proof_path).map_err(|e| format!("read SNARK: {e}"))?;
     let proof_len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     if proof_len != 768 {
@@ -413,7 +398,7 @@ fn generate_zisk_snark_proof(
     }
     let public_values = data[pv_offset + 8..pv_offset + 8 + 256].to_vec();
 
-    tracing::info!(batch_number, work_dir, "ZiSK SNARK proof generated");
+    tracing::info!(batch_number, work_dir, "ZiSK GPU SNARK proof generated");
     Ok((snark_proof_bytes, public_values))
 }
 
