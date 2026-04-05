@@ -1,97 +1,12 @@
-//! GPU Prover Orchestrator
+//! Airbender GPU prover process lifecycle management.
 //!
-//! Manages GPU sharing between the Airbender prover (external process) and
-//! ZiSK SNARK generation (in-process). Both need the GPU but can't run
-//! simultaneously on a single GPU.
-//!
-//! Flow per round:
-//! 1. Start Airbender prover with `--iterations N` (exits after N SNARKs)
-//! 2. Wait for it to exit (GPU freed)
-//! 3. MultiProofCombiner acquires GPU lock, runs ZiSK STARK+SNARK
-//! 4. ZiSK finishes, releases GPU lock
-//! 5. Restart Airbender prover
+//! Starts the Airbender prover with `--iterations N`, waits for it to exit
+//! (freeing GPU memory), then lets the `MultiProofCombiner` use the GPU for
+//! ZiSK before restarting.
 
+use crate::prover_api::gpu_coordinator::GpuCoordinator;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify};
-
-/// Shared GPU coordination state between the Airbender prover orchestrator
-/// and the ZiSK `MultiProofCombiner`.
-///
-/// State machine:
-/// ```text
-/// [Airbender running] → prover_stopped() → [GPU free]
-///     → acquire_gpu_for_zisk() → [ZiSK running]
-///     → release_gpu_from_zisk() → [GPU free]
-///     → wait_for_zisk_done() → [Airbender starts]
-/// ```
-pub struct GpuCoordinator {
-    /// True when the Airbender prover process is active.
-    prover_running: Mutex<bool>,
-    /// Signaled when the prover exits (GPU becomes available).
-    gpu_available: Notify,
-    /// Signaled when ZiSK finishes (GPU available for Airbender restart).
-    zisk_done: Notify,
-    /// True when ZiSK is generating proofs on GPU.
-    zisk_pending: Mutex<bool>,
-}
-
-impl GpuCoordinator {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            prover_running: Mutex::new(false),
-            gpu_available: Notify::new(),
-            zisk_done: Notify::new(),
-            zisk_pending: Mutex::new(false),
-        })
-    }
-
-    pub async fn prover_started(&self) {
-        *self.prover_running.lock().await = true;
-    }
-
-    pub async fn prover_stopped(&self) {
-        *self.prover_running.lock().await = false;
-        self.gpu_available.notify_waiters();
-    }
-
-    /// Wait for the Airbender prover to exit, then claim GPU for ZiSK.
-    /// Logs a warning every 60s while waiting.
-    pub async fn acquire_gpu_for_zisk(&self) {
-        loop {
-            if !*self.prover_running.lock().await {
-                *self.zisk_pending.lock().await = true;
-                return;
-            }
-            // Wait with periodic logging so operators know we're blocked.
-            match tokio::time::timeout(
-                Duration::from_secs(60),
-                self.gpu_available.notified(),
-            )
-            .await
-            {
-                Ok(()) => {} // Notified — recheck.
-                Err(_) => {
-                    tracing::warn!("still waiting for GPU (Airbender prover running)");
-                }
-            }
-        }
-    }
-
-    pub async fn release_gpu_from_zisk(&self) {
-        *self.zisk_pending.lock().await = false;
-        self.zisk_done.notify_waiters();
-    }
-
-    pub async fn wait_for_zisk_done(&self) {
-        loop {
-            if !*self.zisk_pending.lock().await {
-                return;
-            }
-            self.zisk_done.notified().await;
-        }
-    }
-}
 
 /// Configuration for the Airbender GPU prover subprocess.
 pub struct AirbenderGpuConfig {
@@ -103,7 +18,7 @@ pub struct AirbenderGpuConfig {
     pub iterations_per_round: u32,
 }
 
-/// Delay between prover restart attempts on failure (seconds).
+/// Delay between prover restart attempts on failure.
 const PROVER_RETRY_DELAY_SECS: u64 = 10;
 /// Brief pause after prover exits to let ZiSK claim GPU.
 const GPU_HANDOFF_DELAY_SECS: u64 = 2;
@@ -166,23 +81,34 @@ impl GpuProverOrchestrator {
                 }
             }
 
-            // Brief pause to let ZiSK claim GPU if needed.
             tokio::time::sleep(Duration::from_secs(GPU_HANDOFF_DELAY_SECS)).await;
         }
     }
 
     async fn run_prover_process(&self) -> anyhow::Result<i32> {
-        let binary = self.config.prover_binary.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("airbender_gpu.prover_binary not configured"))?;
-        let crs_file = self.config.crs_file.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("airbender_gpu.crs_file not configured"))?;
-        let app_bin = self.config.app_bin_path.as_deref()
-            .ok_or_else(|| anyhow::anyhow!("airbender_gpu.app_bin_path not configured"))?;
-        let output_dir = self.config.output_dir.as_deref().unwrap_or("/tmp/prover_output");
+        let binary = self
+            .config
+            .prover_binary
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("gpu_prover_binary not configured"))?;
+        let crs_file = self
+            .config
+            .crs_file
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("gpu_prover_crs_file not configured"))?;
+        let app_bin = self
+            .config
+            .app_bin_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("gpu_prover_app_bin not configured"))?;
+        let output_dir = self
+            .config
+            .output_dir
+            .as_deref()
+            .unwrap_or("./db/prover_output");
 
         let _ = std::fs::create_dir_all(output_dir);
 
-        // Spawn child process directly (no shell, no injection risk).
         let mut child = tokio::process::Command::new(binary)
             .arg("--sequencer-urls")
             .arg(&self.sequencer_url)

@@ -9,11 +9,19 @@
 //! - Path validation at construction time (fail-fast)
 //! - Subprocess stderr captured for diagnostics
 
-use crate::config::ProverInputGeneratorConfig;
 use crate::prover_api::zisk_proof_constants::{ZISK_PUBLIC_VALUES_BYTES, ZISK_SNARK_PROOF_BYTES};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
+
+/// Configuration for the ZiSK prover (extracted from ProverInputGeneratorConfig).
+pub struct ZiskProverConfig {
+    pub binary: Option<String>,
+    pub elf_path: Option<String>,
+    pub proving_key: Option<String>,
+    pub proving_key_snark: Option<String>,
+    pub work_dir: Option<String>,
+}
 
 /// Validated ZiSK SNARK proof output.
 pub struct ZiskSnarkOutput {
@@ -74,19 +82,19 @@ pub struct ZiskProver {
 }
 
 impl ZiskProver {
-    /// Create a prover from config, validating that all required paths exist.
+    /// Create a prover, validating that all required paths exist.
     ///
     /// Returns `Err` if any required field is `None` or points to a missing file.
     /// Called at server startup to fail fast on misconfiguration.
-    pub fn from_config(config: &ProverInputGeneratorConfig) -> Result<Self, ZiskProverError> {
-        let binary = require_path(&config.zisk_binary, "zisk_binary")?;
-        let elf_path = require_path(&config.zisk_elf_path, "zisk_elf_path")?;
-        let proving_key = require_path(&config.zisk_proving_key, "zisk_proving_key")?;
+    pub fn from_config(config: &ZiskProverConfig) -> Result<Self, ZiskProverError> {
+        let binary = require_path(&config.binary, "zisk_binary")?;
+        let elf_path = require_path(&config.elf_path, "zisk_elf_path")?;
+        let proving_key = require_path(&config.proving_key, "zisk_proving_key")?;
         let proving_key_snark =
-            require_path(&config.zisk_proving_key_snark, "zisk_proving_key_snark")?;
+            require_path(&config.proving_key_snark, "zisk_proving_key_snark")?;
         let work_dir_base = PathBuf::from(
             config
-                .zisk_work_dir
+                .work_dir
                 .as_deref()
                 .unwrap_or("./db/zisk_proofs"),
         );

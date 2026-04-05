@@ -20,13 +20,12 @@ use crate::prover_api::prover_job_map::ProverJobMap;
 use alloy::primitives::Bytes;
 use jsonrpsee::core::Serialize;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Permit;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::Mutex;
 use zksync_os_l1_sender::batcher_metrics::BatchExecutionStage;
 use zksync_os_l1_sender::batcher_model::{
     BatchMetadata, FriProof, ProverInput, RealFriProof, SignedBatchEnvelope,
@@ -80,7 +79,7 @@ pub struct JobState {
     pub current_attempt: usize,
 }
 
-// Manual Debug impl because Mutex<HashMap> doesn't derive Debug cleanly.
+// Manual Debug impl because ProofStorage and other fields don't derive Debug.
 impl std::fmt::Debug for FriJobManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FriJobManager").finish_non_exhaustive()
@@ -94,9 +93,8 @@ pub struct FriJobManager {
     batches_with_proof_sender: mpsc::Sender<SignedBatchEnvelope<FriProof>>,
     // == storage ==
     proof_storage: ProofStorage,
-    /// Cache of ZiSK batch data (bincode-serialized BatchInput) by batch number.
-    /// Saved when batches enter the queue, consumed when composing multi-proof proofs.
-    zisk_data_cache: Mutex<HashMap<u64, Vec<u8>>>,
+    /// External cache for ZiSK batch data (optional, set when second_proof_system is enabled).
+    zisk_data_cache: Option<Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>>,
     // == metrics ==
     latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
@@ -121,39 +119,26 @@ impl FriJobManager {
             jobs,
             batches_with_proof_sender,
             proof_storage,
-            zisk_data_cache: Mutex::new(HashMap::new()),
+            zisk_data_cache: None,
             latency_tracker,
         }
     }
 
+    /// Set the ZiSK data cache (call before adding jobs when second_proof_system is enabled).
+    pub fn set_zisk_data_cache(&mut self, cache: Arc<crate::prover_api::zisk_data_cache::ZiskDataCache>) {
+        self.zisk_data_cache = Some(cache);
+    }
+
     /// Adds a pending job to the queue.
     /// Awaits if the queue is full (ProverJobMap.max_assigned_batch_range).
-    /// If the ProverInput carries ZiSK data, it's cached for later multi-proof composition.
+    /// If the ProverInput carries ZiSK data and a cache is configured, stores it.
     pub async fn add_job(&self, batch_envelope: SignedBatchEnvelope<ProverInput>) {
-        if let Some(zisk_bytes) = batch_envelope.data.zisk_data() {
+        if let (Some(cache), Some(zisk_bytes)) = (&self.zisk_data_cache, batch_envelope.data.zisk_data()) {
             let batch_number = batch_envelope.batch_number();
-            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "Caching ZiSK data for multi-proof");
-            self.zisk_data_cache.lock().await.insert(batch_number, zisk_bytes.to_vec());
+            tracing::info!(batch_number, zisk_bytes = zisk_bytes.len(), "caching ZiSK data for multi-proof");
+            cache.insert(batch_number, zisk_bytes.to_vec()).await;
         }
         self.jobs.add_job(batch_envelope).await
-    }
-
-    /// Remove and return cached ZiSK data for the given batch.
-    /// Called after successful ZiSK SNARK generation to free memory.
-    pub async fn remove_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
-        self.zisk_data_cache.lock().await.remove(&batch_number)
-    }
-
-    /// Check whether ZiSK data exists for the given batch without consuming it.
-    /// Used by `submit_proof` to decide whether to cache the Airbender SNARK.
-    pub async fn contains_zisk_data(&self, batch_number: u64) -> bool {
-        self.zisk_data_cache.lock().await.contains_key(&batch_number)
-    }
-
-    /// Clone cached ZiSK data for the given batch without consuming it.
-    /// Used by `MultiProofCombiner` so the data survives retry on failure.
-    pub async fn get_zisk_data(&self, batch_number: u64) -> Option<Vec<u8>> {
-        self.zisk_data_cache.lock().await.get(&batch_number).cloned()
     }
 
     /// Peek batch data for a given batch number

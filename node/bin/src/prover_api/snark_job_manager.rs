@@ -1,6 +1,7 @@
-use crate::prover_api::fri_job_manager::{FriJob, FriJobManager};
+use crate::prover_api::fri_job_manager::FriJob;
 use crate::prover_api::metrics::{ProverStage, ProverType};
 use crate::prover_api::prover_job_map::ProverJobMap;
+use crate::prover_api::zisk_data_cache::ZiskDataCache;
 use crate::prover_api::zisk_prover::ZiskProver;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ pub struct SnarkJobManager {
     jobs: ProverJobMap<FriProof>,
     prove_batches_sender: Sender<ProofCommand>,
     max_fris_per_snark: usize,
-    fri_job_manager: Option<Arc<FriJobManager>>,
+    zisk_data_cache: Option<Arc<ZiskDataCache>>,
     /// Airbender SNARKs waiting for ZiSK SNARK generation.
     pending_multi_proofs: Mutex<HashMap<u64, PendingMultiProof>>,
     latency_tracker: ComponentStateHandle<GenericComponentState>,
@@ -63,14 +64,15 @@ impl SnarkJobManager {
             jobs,
             prove_batches_sender,
             max_fris_per_snark,
-            fri_job_manager: None,
+            zisk_data_cache: None,
             pending_multi_proofs: Mutex::new(HashMap::new()),
             latency_tracker,
         }
     }
 
-    pub fn set_fri_job_manager(&mut self, fjm: Arc<FriJobManager>) {
-        self.fri_job_manager = Some(fjm);
+    /// Set the ZiSK data cache for multi-proof composition.
+    pub fn set_zisk_data_cache(&mut self, cache: Arc<ZiskDataCache>) {
+        self.zisk_data_cache = Some(cache);
     }
 
     /// Adds a pending job to the SNARK proving queue.
@@ -130,8 +132,8 @@ impl SnarkJobManager {
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
-        let has_zisk = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.contains_zisk_data(batch_from).await
+        let has_zisk = if let Some(ref cache) = self.zisk_data_cache {
+            cache.contains(batch_from).await
         } else {
             false
         };
@@ -193,8 +195,8 @@ impl SnarkJobManager {
         };
 
         // Clone ZiSK data (preserve original for retry).
-        let zisk_bincode = if let Some(ref fjm) = self.fri_job_manager {
-            fjm.get_zisk_data(batch_num).await
+        let zisk_bincode = if let Some(ref cache) = self.zisk_data_cache {
+            cache.get(batch_num).await
         } else {
             None
         };
@@ -224,8 +226,8 @@ impl SnarkJobManager {
         match zisk_result {
             Ok(output) => {
                 // Success — remove ZiSK data from cache.
-                if let Some(ref fjm) = self.fri_job_manager {
-                    fjm.remove_zisk_data(batch_num).await;
+                if let Some(ref cache) = self.zisk_data_cache {
+                    cache.remove(batch_num).await;
                 }
 
                 tracing::info!(
@@ -348,7 +350,7 @@ pub struct FakeSnarkProver {
 pub struct MultiProofCombiner {
     job_manager: Arc<SnarkJobManager>,
     zisk_prover: ZiskProver,
-    gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
+    gpu_coordinator: Option<Arc<crate::prover_api::gpu_coordinator::GpuCoordinator>>,
     polling_interval: Duration,
     retry_delay: Duration,
 }
@@ -380,7 +382,7 @@ impl MultiProofCombiner {
     pub fn new(
         job_manager: Arc<SnarkJobManager>,
         zisk_prover: ZiskProver,
-        gpu_coordinator: Option<Arc<crate::prover_api::gpu_orchestrator::GpuCoordinator>>,
+        gpu_coordinator: Option<Arc<crate::prover_api::gpu_coordinator::GpuCoordinator>>,
     ) -> Self {
         Self {
             job_manager,

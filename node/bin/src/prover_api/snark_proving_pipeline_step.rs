@@ -32,15 +32,15 @@ impl SnarkProvingPipelineStep {
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
     ) -> (Self, Arc<SnarkJobManager>) {
-        Self::new_with_fri(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None)
+        Self::new_with_zisk_cache(max_fris_per_snark, last_proved_batch_number, assignment_timeout, max_assigned_batch_range, None)
     }
 
-    pub fn new_with_fri(
+    pub fn new_with_zisk_cache(
         max_fris_per_snark: usize,
         last_proved_batch_number: u64,
         assignment_timeout: Duration,
         max_assigned_batch_range: usize,
-        fri_job_manager: Option<Arc<super::fri_job_manager::FriJobManager>>,
+        zisk_data_cache: Option<Arc<super::zisk_data_cache::ZiskDataCache>>,
     ) -> (Self, Arc<SnarkJobManager>) {
         let (proof_commands_sender, proof_commands_receiver) = mpsc::channel::<ProofCommand>(1);
 
@@ -50,8 +50,8 @@ impl SnarkProvingPipelineStep {
             assignment_timeout,
             max_assigned_batch_range,
         );
-        if let Some(fjm) = fri_job_manager {
-            sjm.set_fri_job_manager(fjm);
+        if let Some(cache) = zisk_data_cache {
+            sjm.set_zisk_data_cache(cache);
         }
         let snark_job_manager = Arc::new(sjm);
 

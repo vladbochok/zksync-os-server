@@ -996,21 +996,30 @@ async fn run_main_node_pipeline(
         .await
         .expect("Failed to initialize ProofStorage");
 
+    // Create shared ZiSK data cache when second_proof_system is enabled.
+    // Passed to both FriProvingPipelineStep (stores data) and SnarkJobManager (reads data).
+    let zisk_data_cache = if config.prover_input_generator_config.second_proof_system {
+        tracing::info!("ZiSK proof generation enabled");
+        Some(Arc::new(crate::prover_api::zisk_data_cache::ZiskDataCache::new()))
+    } else {
+        None
+    };
+
     let (fri_proving_step, fri_job_manager) = FriProvingPipelineStep::new(
         proof_storage.clone(),
         node_state_on_startup.l1_state.last_proved_batch,
         config.prover_api_config.fri_job_timeout,
         config.prover_api_config.max_assigned_batch_range,
+        zisk_data_cache.clone(),
     );
 
-    let (snark_proving_step, snark_job_manager) = if config.prover_input_generator_config.second_proof_system {
-        tracing::info!("Two-proof-system enabled: SnarkJobManager will use ZiSK data from FriJobManager");
-        SnarkProvingPipelineStep::new_with_fri(
+    let (snark_proving_step, snark_job_manager) = if zisk_data_cache.is_some() {
+        SnarkProvingPipelineStep::new_with_zisk_cache(
             config.prover_api_config.max_fris_per_snark,
             node_state_on_startup.l1_state.last_proved_batch,
             config.prover_api_config.snark_job_timeout,
             config.prover_api_config.max_assigned_batch_range,
-            Some(fri_job_manager.clone()),
+            zisk_data_cache,
         )
     } else {
         SnarkProvingPipelineStep::new(
@@ -1044,8 +1053,15 @@ async fn run_main_node_pipeline(
     // Spawn the MultiProofCombiner and optional GPU Prover Orchestrator.
     if config.prover_input_generator_config.second_proof_system {
         // Validate ZiSK prover config at startup (optional — only if paths are configured).
+        let zisk_config = crate::prover_api::zisk_prover::ZiskProverConfig {
+            binary: config.prover_input_generator_config.zisk_binary.clone(),
+            elf_path: config.prover_input_generator_config.zisk_elf_path.clone(),
+            proving_key: config.prover_input_generator_config.zisk_proving_key.clone(),
+            proving_key_snark: config.prover_input_generator_config.zisk_proving_key_snark.clone(),
+            work_dir: config.prover_input_generator_config.zisk_work_dir.clone(),
+        };
         let zisk_prover = match crate::prover_api::zisk_prover::ZiskProver::from_config(
-            &config.prover_input_generator_config,
+            &zisk_config,
         ) {
             Ok(prover) => Some(prover),
             Err(e) => {
@@ -1060,7 +1076,7 @@ async fn run_main_node_pipeline(
             .gpu_prover_binary
             .is_some()
         {
-            let coord = crate::prover_api::gpu_orchestrator::GpuCoordinator::new();
+            let coord = crate::prover_api::gpu_coordinator::GpuCoordinator::new();
             let sequencer_url = format!(
                 "http://localhost:{}",
                 config
