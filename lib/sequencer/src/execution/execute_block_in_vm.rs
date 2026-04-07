@@ -355,12 +355,33 @@ pub async fn execute_block_in_vm<V: ViewState>(
         error: e.context("seal_block()").to_string(),
     })?;
 
+    // Capture deployer precompile bytecode hash lookups.
+    // The deployer's setDeployedCodeEVM calls code_by_hash with blake2s hashes.
+    // These are recorded in a thread-local by the patched deployer precompile.
+    // Store the hashes in the block output so the ZiSK input builder can resolve them.
+    {
+        use zksync_os_revm::precompiles::v2::deployer::drain_deployer_bytecode_lookups;
+        let deployer_hashes = drain_deployer_bytecode_lookups();
+        if !deployer_hashes.is_empty() {
+            tracing::info!(count = deployer_hashes.len(), "deployer bytecode hashes captured");
+            // Store as (hash, empty) — the ZiSK input builder resolves the actual preimages.
+            let existing: std::collections::HashSet<_> = output.published_preimages.iter().map(|(h, _)| *h).collect();
+            for hash in deployer_hashes {
+                if !existing.contains(&hash) {
+                    // Use a 32-byte marker so the input builder knows this is a deployer hash
+                    output.published_preimages.push((hash, vec![0xDE; 1]));
+                }
+            }
+        }
+    }
+
     // Since we've overridden the state, we need to insert any forced preimages into the output as well.
     // Note: the fact that we're doing it here, would also affect the block output hash,
     // so we'll be able to check consistency upon re-execution.
     output
         .published_preimages
         .extend(command.force_preimages.iter().map(|(k, v)| (*k, v.clone())));
+
 
     // Remove failed transactions from output.tx_results.
     // Note: Rejected transactions don't affect the VM state or output,

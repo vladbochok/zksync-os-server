@@ -224,12 +224,29 @@ fn assemble_zisk_batch(
         .flat_map(|(bo, _, _, _)| bo.pubdata.iter().copied())
         .collect();
 
+    // Compute block_hashes_blake for the state BEFORE the first block in this batch.
+    // This must match the state commitment preimage used by the server/L1:
+    //   Blake2s(previous_255_block_hashes || current_block_hash)
+    // where "previous_255" are hashes of the 255 blocks before the "current" block,
+    // and "current_block_hash" is the hash of the block that produced this state.
+    //
+    // The block_context.block_hashes array has block_hashes[N] = hash of block (current - N - 1).
+    // For the "before" state at block B, the "current block" that produced this state is block B-1.
+    // The genesis state uses: Blake2s(255 * [0; 32] || genesis_header_hash).
+    //
+    // We need to reconstruct the same ordering: the first 255 entries are the hashes
+    // BEFORE the previous block (indices 1..255 of block_hashes), and the last entry
+    // is block_hashes[0] (the previous block's hash, which IS the "current" for the state).
+    //
+    // However, block_hashes_for_first_block() puts genesis at index 255, not index 0.
+    // So for block 1, block_hashes[0] = 0 and block_hashes[255] = genesis_hash.
+    // The state commitment uses: Blake2s(0, 0, ..., 0, genesis_hash) with genesis_hash LAST.
+    // We need to match that: hash all 256 entries in order [0, 1, 2, ..., 255].
     let block_hashes_blake_before = {
         let mut hasher = Blake2s256::new();
-        for hash in &first_ctx.block_hashes.0[1..] {
+        for hash in &first_ctx.block_hashes.0 {
             hasher.update(hash.to_be_bytes::<32>());
         }
-        hasher.update(first_ctx.block_hashes.0[0].to_be_bytes::<32>());
         alloy::primitives::B256::from_slice(&hasher.finalize())
     };
 
@@ -267,7 +284,14 @@ fn assemble_zisk_batch(
             pubdata,
             multichain_root,
             sl_chain_id,
-            blob_versioned_hashes: vec![],
+            blob_versioned_hashes: batch_info.blob_sidecar
+                .as_ref()
+                .map(|sidecar| {
+                    sidecar.commitments.iter().map(|commitment| {
+                        alloy::eips::eip4844::kzg_to_versioned_hash(commitment.as_slice())
+                    }).collect()
+                })
+                .unwrap_or_default(),
             // Single-block batch: use block's tree update directly.
             // Multi-block: would need chaining (leaves None, guest rejects
             // if REVM produces storage writes).
@@ -285,6 +309,7 @@ fn assemble_zisk_batch(
                 // Set per-block tree root so the executor verifies each block's
                 // merkle proofs against the correct tree version.
                 bi.expected_tree_root = d.tree_root_before;
+                bi.force_deploy_bytecodes = d.force_deploy_bytecodes;
                 bi
             })
             .collect(),

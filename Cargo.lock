@@ -13921,7 +13921,6 @@ dependencies = [
 [[package]]
 name = "zksync-os-revm"
 version = "0.1.0"
-source = "git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4#616c36089058a7d86e9c5af0c668ebefa2230668"
 dependencies = [
  "auto_impl",
  "revm",
@@ -13931,7 +13930,7 @@ dependencies = [
 [[package]]
 name = "zksync-os-revm"
 version = "0.1.0"
-source = "git+https://github.com/vladbochok/zksync-os-revm?branch=vb%2Fsecond-proof-system#9391f9e216047e61cd10c253ab7f59c1148e3b91"
+source = "git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4#616c36089058a7d86e9c5af0c668ebefa2230668"
 dependencies = [
  "auto_impl",
  "revm",
@@ -13950,7 +13949,7 @@ dependencies = [
  "revm",
  "serde",
  "tiny-keccak",
- "zksync-os-revm 0.1.0 (git+https://github.com/vladbochok/zksync-os-revm?branch=vb%2Fsecond-proof-system)",
+ "zksync-os-revm 0.1.0",
 ]
 
 [[package]]
@@ -14720,6 +14719,7 @@ dependencies = [
  "tracing",
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
+ "zksync-os-revm 0.1.0",
  "zksync_os_gas_adjuster",
  "zksync_os_genesis",
  "zksync_os_interface",

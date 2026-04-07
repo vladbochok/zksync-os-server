@@ -39,3 +39,4 @@ tracing.workspace = true
 vise.workspace = true
 semver.workspace = true
 num.workspace = true
+zksync-os-revm = { git = "https://github.com/vladbochok/zksync-os-revm", branch = "vb/second-proof-system", default-features = false }

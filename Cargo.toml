@@ -302,3 +302,6 @@ overflow-checks = true
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+[patch."https://github.com/vladbochok/zksync-os-revm"]
+zksync-os-revm = { path = "/tmp/zksync-os-revm-patched" }

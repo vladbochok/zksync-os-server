@@ -138,9 +138,22 @@ impl SnarkJobManager {
         if has_zisk {
             let zjm = self.zisk_job_manager.as_ref()
                 .expect("zisk_job_manager must be set when zisk_data_cache is set");
-            // Take ZiSK data from cache (consumed — the ZiSK prover will get it via /ZiSK/pick).
-            let zisk_data = self.zisk_data_cache.as_ref().unwrap().remove(batch_from).await
-                .expect("ZiSK data must exist (just checked via contains)");
+            // Atomic remove — avoids TOCTOU race between contains() and remove().
+            let Some(zisk_data) = self.zisk_data_cache.as_ref().unwrap().remove(batch_from).await else {
+                // Another concurrent submit_proof consumed it. Treat as no-ZiSK batch.
+                tracing::warn!(batch = batch_from, "ZiSK data consumed by concurrent submit, sending Airbender-only");
+                let consumed_batches_proven: Vec<_> = consumed_batches_proven
+                    .into_iter()
+                    .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
+                    .collect();
+                return self.send_downstream(ProofCommand::new(
+                    consumed_batches_proven,
+                    SnarkProof::Real(RealSnarkProof::V2 {
+                        proof: payload,
+                        proving_execution_version: proving_version as u32,
+                    }),
+                )).await;
+            };
 
             let batches: Vec<_> = consumed_batches_proven
                 .into_iter()

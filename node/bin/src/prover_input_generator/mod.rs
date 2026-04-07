@@ -154,10 +154,20 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> ProverInputGenerator<
         );
         let enable_second_proof = self.enable_second_proof_system;
         let mut handle = tokio::task::spawn_blocking(move || {
+            // Log tree root AFTER block for comparison with ZiSK tree_update.apply()
+            if let Ok((root_after, leaf_after)) = tree.block_end.root_info() {
+                tracing::info!(
+                    block = tree.block_end.block,
+                    root_after = %root_after,
+                    leaf_after,
+                    "server tree root after block"
+                );
+            }
             let prover_input = compute_prover_input(
                 &replay_record,
                 read_state,
                 tree.block_start.clone(),
+                tree.block_end.clone(),
                 &block_output,
                 da_commitment_scheme,
                 enable_logging,
@@ -189,6 +199,7 @@ fn compute_prover_input(
     replay_record: &ReplayRecord,
     state_handle: impl ReadStateHistory + Clone,
     tree_view: MerkleTreeVersion<RocksDBWrapper>,
+    tree_view_after: MerkleTreeVersion<RocksDBWrapper>,
     block_output: &BlockOutput,
     da_commitment_scheme: DACommitmentScheme,
     enable_logging: bool,
@@ -292,7 +303,7 @@ fn compute_prover_input(
     // Optionally generate ZiSK prover input alongside airbender witness
     let zisk_data = if enable_second_proof {
         tracing::debug!(block_number, "Generating ZiSK prover input alongside airbender witness");
-        match zisk_input_builder::build_block_data(block_output, replay_record, &tree_view, &state_handle) {
+        match zisk_input_builder::build_block_data(block_output, replay_record, &tree_view, &tree_view_after, &state_handle) {
             Ok(block_data) => Some(
                 bincode1::serialize(&block_data).expect("failed to serialize ZiSK BlockData"),
             ),

@@ -1,8 +1,9 @@
 //! Cache for ZiSK batch data awaiting multi-proof composition.
 //!
 //! Stores serialized ZiSK prover input (`bincode`) per batch, populated by the
-//! prover input generator when `second_proof_system` is enabled. Consumed by the
-//! `MultiProofCombiner` after the Airbender SNARK is submitted.
+//! prover input generator when `second_proof_system` is enabled. Consumed by
+//! `SnarkJobManager` after the Airbender SNARK is submitted: the data is removed
+//! atomically and forwarded to `ZiskJobManager` for external ZiSK proving.
 //!
 //! Separated from `FriJobManager` because FRI is an Airbender concern — the ZiSK
 //! data lifecycle is independent of FRI job assignment and timeout management.
@@ -14,14 +15,11 @@ use tokio::sync::Mutex;
 ///
 /// Data flows:
 /// - **In**: `FriProvingPipelineStep` stores data via [`insert`] when a batch enters FRI proving.
-/// - **Out**: `MultiProofCombiner` reads via [`get`] and removes via [`remove`] after successful
-///   ZiSK SNARK generation.
+/// - **Out**: `SnarkJobManager` removes via [`remove`] when the Airbender SNARK arrives,
+///   forwarding the data to `ZiskJobManager` for external proving.
 pub struct ZiskDataCache {
     inner: Mutex<HashMap<u64, Vec<u8>>>,
 }
-
-/// Default work directory for ZiSK proof intermediate files.
-pub(crate) const DEFAULT_ZISK_WORK_DIR: &str = "./db/zisk_proofs";
 
 impl ZiskDataCache {
     pub fn new() -> Self {
@@ -42,7 +40,6 @@ impl ZiskDataCache {
     }
 
     /// Clone ZiSK data for a batch (non-destructive).
-    /// Used by `MultiProofCombiner` so the data survives retry on failure.
     pub async fn get(&self, batch_number: u64) -> Option<Vec<u8>> {
         self.inner.lock().await.get(&batch_number).cloned()
     }

@@ -194,24 +194,35 @@ impl ProofCommand {
                 .collect()
             }
             SnarkProof::MultiProof(multi_proof) => {
-                // Structural validation — must hold in release builds to prevent
-                // invalid L1 calldata. Sizes are set by ZiskProver but verified here
-                // as a defense-in-depth invariant.
-                assert_eq!(multi_proof.zisk_proof.len(), 768);
-                assert_eq!(multi_proof.zisk_public_values.len(), 256);
-                assert_eq!(multi_proof.era_proof.len() % 32, 0);
+                // Defense-in-depth: sizes are validated in ZiskJobManager::submit_proof.
+                debug_assert_eq!(multi_proof.zisk_proof.len(), 768);
+                debug_assert_eq!(multi_proof.zisk_public_values.len(), 256);
+                debug_assert_eq!(multi_proof.era_proof.len() % 32, 0);
 
                 // Cross-proof validation: both proof systems must commit to the same batch.
+                // A mismatch means a critical pipeline bug — the on-chain verifier would
+                // reject it anyway, so failing fast here avoids wasting gas.
                 let zisk_commitment =
                     B256::from_slice(&multi_proof.zisk_public_values[..32]);
                 let era_commitment = Self::get_batch_public_input(
                     previous_batch_info,
                     &stored_batch_infos[0],
                 );
-                assert_eq!(
-                    zisk_commitment, era_commitment,
-                    "batch commitment mismatch: ZiSK={zisk_commitment}, Airbender={era_commitment}"
-                );
+
+                if zisk_commitment != era_commitment {
+                    tracing::error!(
+                        "batch commitment mismatch: ZiSK={zisk_commitment}, \
+                         Airbender={era_commitment}. \
+                         prev_state={}, batch_state={}, batch_hash={}",
+                        previous_batch_info.state_commitment,
+                        stored_batch_infos[0].state_commitment,
+                        stored_batch_infos[0].commitment,
+                    );
+                    panic!(
+                        "batch commitment mismatch: ZiSK={zisk_commitment}, \
+                         Airbender={era_commitment}. This is a critical pipeline bug."
+                    );
+                }
                 tracing::info!("Cross-proof validation passed: commitments match");
 
                 // Convert byte arrays to U256 chunks for L1 calldata encoding.

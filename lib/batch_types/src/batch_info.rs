@@ -193,8 +193,8 @@ impl BatchInfo {
         match protocol_version.minor {
             // v30 and v31 use different packed layouts for batch output hash:
             // v31 inserts number_of_layer2_txs between L1 tx count and priority_operations_hash.
-            30 => B256::from(keccak256(
-                (
+            30 => {
+                let packed = (
                     U256::from(commit_info.chain_id),
                     commit_info.first_block_timestamp,
                     commit_info.last_block_timestamp,
@@ -205,9 +205,14 @@ impl BatchInfo {
                     commit_info.l2_to_l1_logs_root_hash,
                     upgrade_tx_hash,
                     commit_info.dependency_roots_rolling_hash,
-                )
-                    .abi_encode_packed(),
-            )),
+                ).abi_encode_packed();
+                eprintln!(
+                    "PACKED v30: len={} hex={}",
+                    packed.len(),
+                    alloy::primitives::hex::encode(&packed),
+                );
+                B256::from(keccak256(packed))
+            },
             31 | 32 => B256::from(keccak256(
                 (
                     U256::from(commit_info.chain_id),
