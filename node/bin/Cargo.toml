@@ -78,6 +78,7 @@ alloy = { workspace = true, default-features = false, features = [
     "rand",
 ] }
 blake2.workspace = true
+sha2.workspace = true
 clap = { workspace = true, features = ["derive", "wrap_help"] }
 ruint.workspace = true
 tokio = { workspace = true, features = ["full"] }
