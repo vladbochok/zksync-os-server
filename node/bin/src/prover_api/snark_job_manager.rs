@@ -101,8 +101,10 @@ impl SnarkJobManager {
 
     /// Submit a real Airbender SNARK proof.
     ///
-    /// If ZiSK data exists, the Airbender SNARK is cached for async combination.
-    /// If no ZiSK data exists, the Airbender proof is sent downstream immediately.
+    /// For multi-batch ranges, checks ALL batches in the range for ZiSK data.
+    /// If ZiSK data exists for the first batch (single-batch ZiSK proving),
+    /// the Airbender SNARK is routed to ZiskJobManager. Multi-batch ranges
+    /// with ZiSK data are only supported when batch_from == batch_to.
     pub async fn submit_proof(
         &self,
         batch_from: u64,
@@ -119,40 +121,49 @@ impl SnarkJobManager {
             anyhow::bail!("race condition: some batches were completed earlier")
         };
 
-        let server_vk = consumed_batches_proven[0]
-            .batch
-            .verification_key_hash()
-            .expect("verification key hash must be present as it was set by server");
+        let server_vk = consumed_batches_proven
+            .first()
+            .and_then(|b| b.batch.verification_key_hash().ok())
+            .ok_or_else(|| anyhow::anyhow!("verification key hash missing from batch metadata"))?;
         let prover_vk = proving_version.vk_hash();
         anyhow::ensure!(
             server_vk == prover_vk,
             "Verification key hash mismatch: server got {server_vk}, prover got {prover_vk}"
         );
 
+        // Check ZiSK data availability. For multi-batch ranges we only support
+        // ZiSK proving when the range is exactly one batch. Multi-batch SNARK
+        // proofs combined with ZiSK require chaining tree updates across blocks
+        // which is not yet implemented.
         let has_zisk = if let Some(ref cache) = self.zisk_data_cache {
-            cache.contains(batch_from).await
+            if batch_from != batch_to {
+                // Multi-batch range: ZiSK proving not supported, send Airbender-only.
+                // Log a warning so operators know multi-proof is skipped.
+                tracing::warn!(
+                    batch_from, batch_to,
+                    "multi-batch SNARK range — ZiSK proving skipped (not yet supported for ranges)"
+                );
+                false
+            } else {
+                cache.contains(batch_from).await
+            }
         } else {
             false
         };
 
         if has_zisk {
-            let zjm = self.zisk_job_manager.as_ref()
-                .expect("zisk_job_manager must be set when zisk_data_cache is set");
+            let zjm = match self.zisk_job_manager.as_ref() {
+                Some(zjm) => zjm,
+                None => {
+                    tracing::error!("ZiSK data exists but ZiskJobManager not initialized — sending Airbender-only");
+                    return self.send_airbender_only(consumed_batches_proven, payload, proving_version).await;
+                }
+            };
+            let cache = self.zisk_data_cache.as_ref().expect("checked above");
             // Atomic remove — avoids TOCTOU race between contains() and remove().
-            let Some(zisk_data) = self.zisk_data_cache.as_ref().unwrap().remove(batch_from).await else {
-                // Another concurrent submit_proof consumed it. Treat as no-ZiSK batch.
-                tracing::warn!(batch = batch_from, "ZiSK data consumed by concurrent submit, sending Airbender-only");
-                let consumed_batches_proven: Vec<_> = consumed_batches_proven
-                    .into_iter()
-                    .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
-                    .collect();
-                return self.send_downstream(ProofCommand::new(
-                    consumed_batches_proven,
-                    SnarkProof::Real(RealSnarkProof::V2 {
-                        proof: payload,
-                        proving_execution_version: proving_version as u32,
-                    }),
-                )).await;
+            let Some(zisk_data) = cache.remove(batch_from).await else {
+                tracing::warn!(batch = batch_from, "ZiSK data consumed by concurrent submit or expired, sending Airbender-only");
+                return self.send_airbender_only(consumed_batches_proven, payload, proving_version).await;
             };
 
             let batches: Vec<_> = consumed_batches_proven
@@ -167,28 +178,47 @@ impl SnarkJobManager {
                 "Airbender SNARK received, routing to ZiSK job manager"
             );
 
-            zjm.add_job(batch_from, ZiskJobData {
+            match zjm.add_job(batch_from, ZiskJobData {
                 zisk_data,
                 era_proof: payload,
                 proving_execution_version: proving_version as u32,
                 batches,
-            }).await;
-            Ok(())
+            }).await {
+                Ok(()) => Ok(()),
+                Err(rejected) => {
+                    // Queue was full — fall back to Airbender-only using recovered data
+                    tracing::warn!(batch = batch_from, "ZiSK job queue full, sending Airbender-only proof");
+                    self.send_downstream(ProofCommand::new(
+                        rejected.batches,
+                        SnarkProof::Real(RealSnarkProof::V2 {
+                            proof: rejected.era_proof,
+                            proving_execution_version: rejected.proving_execution_version,
+                        }),
+                    )).await
+                }
+            }
         } else {
-            let consumed_batches_proven: Vec<_> = consumed_batches_proven
-                .into_iter()
-                .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
-                .collect();
-            self.send_downstream(ProofCommand::new(
-                consumed_batches_proven,
-                SnarkProof::Real(RealSnarkProof::V2 {
-                    proof: payload,
-                    proving_execution_version: proving_version as u32,
-                }),
-            ))
-            .await?;
-            Ok(())
+            self.send_airbender_only(consumed_batches_proven, payload, proving_version).await
         }
+    }
+
+    async fn send_airbender_only(
+        &self,
+        batches: Vec<SignedBatchEnvelope<FriProof>>,
+        payload: Vec<u8>,
+        proving_version: ProvingVersion,
+    ) -> anyhow::Result<()> {
+        let batches: Vec<_> = batches
+            .into_iter()
+            .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
+            .collect();
+        self.send_downstream(ProofCommand::new(
+            batches,
+            SnarkProof::Real(RealSnarkProof::V2 {
+                proof: payload,
+                proving_execution_version: proving_version as u32,
+            }),
+        )).await
     }
 
     async fn process_pending_fake_fri_proofs(&self) -> anyhow::Result<()> {

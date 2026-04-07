@@ -25,6 +25,10 @@ use zksync_os_observability::{
 };
 use tokio::sync::mpsc::Sender;
 
+/// Maximum number of pending + assigned ZiSK jobs.
+/// Prevents unbounded memory growth if ZiSK provers are slow or offline.
+const MAX_TOTAL_JOBS: usize = 50;
+
 /// Data stored per ZiSK job: the ZiSK prover input and the Airbender SNARK.
 pub struct ZiskJobData {
     /// Bincode-serialized BatchInput for cargo-zisk.
@@ -53,6 +57,8 @@ pub enum ZiskSubmitError {
     InvalidProofSize { got: usize, expected: usize },
     #[error("invalid public values size: {got} bytes, expected {expected}")]
     InvalidPublicValuesSize { got: usize, expected: usize },
+    #[error("batch commitment mismatch: ZiSK public values first 32 bytes do not match batch commitment")]
+    CommitmentMismatch,
     #[error("downstream channel closed")]
     DownstreamClosed,
 }
@@ -92,8 +98,22 @@ impl ZiskJobManager {
     /// Add a batch ready for ZiSK proving.
     ///
     /// Called by `SnarkJobManager::submit_proof` when an Airbender SNARK arrives
-    /// and ZiSK data is available.
-    pub async fn add_job(&self, batch_number: u64, job_data: ZiskJobData) {
+    /// and ZiSK data is available. Returns `Ok(())` on success, or
+    /// `Err(job_data)` if the queue is full (caller can fall back to Airbender-only).
+    pub async fn add_job(&self, batch_number: u64, job_data: ZiskJobData) -> Result<(), ZiskJobData> {
+        let pending_count = self.pending_jobs.lock().await.len();
+        let assigned_count = self.assigned_jobs.lock().await.len();
+        if pending_count + assigned_count >= MAX_TOTAL_JOBS {
+            tracing::error!(
+                batch = batch_number,
+                pending = pending_count,
+                assigned = assigned_count,
+                max = MAX_TOTAL_JOBS,
+                "ZiSK job queue full — rejecting job. ZiSK provers may be offline."
+            );
+            return Err(job_data);
+        }
+
         tracing::info!(
             batch = batch_number,
             zisk_data_bytes = job_data.zisk_data.len(),
@@ -101,6 +121,7 @@ impl ZiskJobManager {
             "ZiSK job added"
         );
         self.pending_jobs.lock().await.insert(batch_number, job_data);
+        Ok(())
     }
 
     /// Pick the next available ZiSK job for a prover.
@@ -135,14 +156,15 @@ impl ZiskJobManager {
         let batch_number = *pending.keys().min()?;
         let job_data = pending.remove(&batch_number)?;
 
-        // Use the verification key hash from the batch metadata — same VK hash
-        // that was validated when the Airbender SNARK was submitted.
         let vk_hash = job_data
             .batches
             .first()
             .and_then(|b| b.batch.verification_key_hash().ok())
             .map(|h| format!("0x{h}"))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                tracing::warn!(batch = batch_number, "VK hash missing from batch metadata");
+                String::new()
+            });
 
         let zisk_data = job_data.zisk_data.clone();
 
@@ -167,8 +189,9 @@ impl ZiskJobManager {
 
     /// Submit a ZiSK SNARK proof for a batch.
     ///
-    /// Validates proof sizes, pairs with the cached Airbender SNARK,
-    /// and sends the combined MultiProof downstream.
+    /// Validates proof sizes and batch commitment, pairs with the cached
+    /// Airbender SNARK, and sends the combined MultiProof downstream.
+    /// On downstream send failure, the job is returned to pending queue.
     pub async fn submit_proof(
         &self,
         batch_number: u64,
@@ -199,6 +222,39 @@ impl ZiskJobManager {
             }
         };
 
+        // Validate batch commitment: first 32 bytes of ZiSK public values
+        // must match the batch commitment derived from the Airbender proof's
+        // batch metadata. This catches honest-but-buggy provers early,
+        // avoiding wasted gas on L1.
+        if public_values.len() >= 32 {
+            let zisk_commitment = alloy::primitives::B256::from_slice(&public_values[..32]);
+            // Compute expected commitment from batch metadata
+            if let Some(first_batch) = job_data.batches.first() {
+                let stored = first_batch
+                    .batch
+                    .batch_info
+                    .clone()
+                    .into_stored(&first_batch.batch.protocol_version);
+                let prev = &first_batch.batch.previous_stored_batch_info;
+                let mut bytes = Vec::with_capacity(96);
+                bytes.extend_from_slice(prev.state_commitment.as_slice());
+                bytes.extend_from_slice(stored.state_commitment.as_slice());
+                bytes.extend_from_slice(stored.commitment.as_slice());
+                let expected = alloy::primitives::keccak256(&bytes);
+                if zisk_commitment != expected {
+                    tracing::error!(
+                        batch = batch_number,
+                        zisk = %zisk_commitment,
+                        expected = %expected,
+                        "ZiSK proof commitment does not match batch commitment"
+                    );
+                    // Return job to pending so it can be retried
+                    self.pending_jobs.lock().await.insert(batch_number, job_data);
+                    return Err(ZiskSubmitError::CommitmentMismatch);
+                }
+            }
+        }
+
         tracing::info!(
             batch = batch_number,
             prover_id,
@@ -221,12 +277,32 @@ impl ZiskJobManager {
             .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))
             .collect();
 
+        let proof_command = ProofCommand::new(batches, snark_proof);
+
         self.latency_tracker
             .enter_state(GenericComponentState::WaitingSend);
-        self.prove_sender
-            .send(ProofCommand::new(batches, snark_proof))
-            .await
-            .map_err(|_| ZiskSubmitError::DownstreamClosed)?;
+        if let Err(err) = self.prove_sender.send(proof_command).await {
+            self.latency_tracker
+                .enter_state(GenericComponentState::ProcessingOrWaitingRecv);
+            // Downstream closed — recover the job data from the failed ProofCommand.
+            // The ProofCommand owns the data; extract and return to pending.
+            let failed_command = err.0;
+            let (batches_back, snark_back) = failed_command.into_parts();
+            if let SnarkProof::MultiProof(mp) = snark_back {
+                let recovered = ZiskJobData {
+                    zisk_data: vec![], // original data already consumed, but proof is intact
+                    era_proof: mp.era_proof,
+                    proving_execution_version: mp.proving_execution_version,
+                    batches: batches_back,
+                };
+                tracing::error!(
+                    batch = batch_number,
+                    "downstream channel closed, returning ZiSK job to pending queue"
+                );
+                self.pending_jobs.lock().await.insert(batch_number, recovered);
+            }
+            return Err(ZiskSubmitError::DownstreamClosed);
+        }
         self.latency_tracker
             .enter_state(GenericComponentState::ProcessingOrWaitingRecv);
 

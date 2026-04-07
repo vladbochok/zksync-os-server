@@ -14,15 +14,40 @@ const FAKE_PROOF_TYPE: u32 = 3;
 const FAKE_PROOF_MAGIC_VALUE: u32 = 13;
 const MULTI_PROOF_TYPE: u32 = 5;
 
+/// ZiSK Plonk proof: 24 BN254 field elements = 768 bytes.
+const ZISK_SNARK_PROOF_BYTES: usize = 768;
+/// ZiSK public values: 8 uint256 slots = 256 bytes.
+const ZISK_PUBLIC_VALUES_BYTES: usize = 256;
+
 #[derive(Debug)]
 pub struct ProofCommand {
     batches: Vec<SignedBatchEnvelope<FriProof>>,
     proof: SnarkProof,
 }
 
+/// Errors from proof calldata encoding.
+#[derive(Debug, thiserror::Error)]
+pub enum ProofEncodingError {
+    #[error("batch commitment mismatch: ZiSK={zisk}, Airbender={era}")]
+    BatchCommitmentMismatch { zisk: B256, era: B256 },
+    #[error("invalid ZiSK proof size: {got} bytes, expected {expected}")]
+    InvalidZiskProofSize { got: usize, expected: usize },
+    #[error("invalid ZiSK public values size: {got} bytes, expected {expected}")]
+    InvalidZiskPublicValuesSize { got: usize, expected: usize },
+    #[error("Airbender proof length ({len}) is not a multiple of 32")]
+    AirbenderProofNotAligned { len: usize },
+    #[error("unsupported execution version: {version}")]
+    UnsupportedExecutionVersion { version: u32 },
+}
+
 impl ProofCommand {
     pub fn new(batches: Vec<SignedBatchEnvelope<FriProof>>, proof: SnarkProof) -> Self {
         Self { batches, proof }
+    }
+
+    /// Decompose into parts. Used for error recovery when downstream send fails.
+    pub fn into_parts(self) -> (Vec<SignedBatchEnvelope<FriProof>>, SnarkProof) {
+        (self.batches, self.proof)
     }
 }
 
@@ -122,10 +147,15 @@ impl ProofCommand {
         result.unwrap()
     }
     fn to_calldata_suffix(&self) -> Vec<u8> {
+        self.try_to_calldata_suffix()
+            .expect("proof calldata encoding failed — this is a critical pipeline bug")
+    }
+
+    fn try_to_calldata_suffix(&self) -> Result<Vec<u8>, ProofEncodingError> {
         let previous_batch_info = &self
             .batches
             .first()
-            .unwrap()
+            .expect("ProofCommand must have at least one batch")
             .batch
             .previous_stored_batch_info;
         let stored_batch_infos: Vec<StoredBatchInfo> = self
@@ -139,36 +169,24 @@ impl ProofCommand {
                     .into_stored(&batch.batch.protocol_version)
             })
             .collect();
-        // todo: awful and temporary
         let verifier_version = match self.proof.proving_execution_version() {
-            // Use default verifier for fake proofs.
             None => 0,
             Some(4) => 4,
             Some(5) => 5,
             Some(6) => 6,
-            // For multi-proof system, the verifier version is carried alongside.
-            // MULTI_PROOF_TYPE (5) tells the MultiProofVerifier to verify both proofs.
             Some(v) if matches!(self.proof, SnarkProof::MultiProof(_)) => v,
-            Some(execution_version) => panic!(
-                "unsupported or old execution version: {execution_version}; there's no verifier defined for it"
-            ),
+            Some(version) => return Err(ProofEncodingError::UnsupportedExecutionVersion { version }),
         };
 
-        // todo: remove tostring
         let public_input = Self::snark_public_input(previous_batch_info, &stored_batch_infos);
-
-        tracing::info!(">> public input: {}", public_input);
+        tracing::info!(public_input = %public_input, "computed SNARK public input");
 
         let proof: Vec<U256> = match &self.proof {
             SnarkProof::Fake => {
                 vec![
-                    // Fake proof type
                     U256::from(FAKE_PROOF_TYPE),
-                    // OhBender 'previous hash' - for fake proof, we can always assume that it matches the range perfectly.
                     U256::from(0),
-                    // Fake proof magic value (just for sanity)
                     U256::from(FAKE_PROOF_MAGIC_VALUE),
-                    // Public input (fake proof **will** verify this against batch data stored in the contract)
                     U256::from_be_bytes(public_input.0),
                 ]
             }
@@ -184,9 +202,7 @@ impl ProofCommand {
                     })
                     .collect();
                 vec![
-                    // Real proof versioned with a specific verifier
                     U256::from(OHBENDER_PROOF_TYPE | (verifier_version << 8)),
-                    // we generate SNARK proofs to always match the range perfectly.
                     U256::from(0),
                 ]
                 .into_iter()
@@ -194,39 +210,48 @@ impl ProofCommand {
                 .collect()
             }
             SnarkProof::MultiProof(multi_proof) => {
-                // Defense-in-depth: sizes are validated in ZiskJobManager::submit_proof.
-                debug_assert_eq!(multi_proof.zisk_proof.len(), 768);
-                debug_assert_eq!(multi_proof.zisk_public_values.len(), 256);
-                debug_assert_eq!(multi_proof.era_proof.len() % 32, 0);
+                // Validate proof sizes — these are invariants of the ZiSK Plonk verifier.
+                if multi_proof.zisk_proof.len() != ZISK_SNARK_PROOF_BYTES {
+                    return Err(ProofEncodingError::InvalidZiskProofSize {
+                        got: multi_proof.zisk_proof.len(),
+                        expected: ZISK_SNARK_PROOF_BYTES,
+                    });
+                }
+                if multi_proof.zisk_public_values.len() != ZISK_PUBLIC_VALUES_BYTES {
+                    return Err(ProofEncodingError::InvalidZiskPublicValuesSize {
+                        got: multi_proof.zisk_public_values.len(),
+                        expected: ZISK_PUBLIC_VALUES_BYTES,
+                    });
+                }
+                if multi_proof.era_proof.len() % 32 != 0 {
+                    return Err(ProofEncodingError::AirbenderProofNotAligned {
+                        len: multi_proof.era_proof.len(),
+                    });
+                }
 
                 // Cross-proof validation: both proof systems must commit to the same batch.
-                // A mismatch means a critical pipeline bug — the on-chain verifier would
-                // reject it anyway, so failing fast here avoids wasting gas.
                 let zisk_commitment =
                     B256::from_slice(&multi_proof.zisk_public_values[..32]);
                 let era_commitment = Self::get_batch_public_input(
                     previous_batch_info,
                     &stored_batch_infos[0],
                 );
-
                 if zisk_commitment != era_commitment {
                     tracing::error!(
-                        "batch commitment mismatch: ZiSK={zisk_commitment}, \
-                         Airbender={era_commitment}. \
-                         prev_state={}, batch_state={}, batch_hash={}",
-                        previous_batch_info.state_commitment,
-                        stored_batch_infos[0].state_commitment,
-                        stored_batch_infos[0].commitment,
+                        zisk = %zisk_commitment,
+                        era = %era_commitment,
+                        prev_state = %previous_batch_info.state_commitment,
+                        batch_state = %stored_batch_infos[0].state_commitment,
+                        batch_hash = %stored_batch_infos[0].commitment,
+                        "batch commitment mismatch between ZiSK and Airbender"
                     );
-                    panic!(
-                        "batch commitment mismatch: ZiSK={zisk_commitment}, \
-                         Airbender={era_commitment}. This is a critical pipeline bug."
-                    );
+                    return Err(ProofEncodingError::BatchCommitmentMismatch {
+                        zisk: zisk_commitment,
+                        era: era_commitment,
+                    });
                 }
-                tracing::info!("Cross-proof validation passed: commitments match");
+                tracing::info!("cross-proof validation passed: commitments match");
 
-                // Convert byte arrays to U256 chunks for L1 calldata encoding.
-                // Safety: sizes validated by debug_assert above.
                 let to_u256_chunks = |bytes: &[u8]| -> Vec<U256> {
                     bytes
                         .chunks_exact(32)
@@ -241,23 +266,14 @@ impl ProofCommand {
                 let zisk_proof_chunks = to_u256_chunks(&multi_proof.zisk_proof);
                 let zisk_pv_chunks = to_u256_chunks(&multi_proof.zisk_public_values);
 
-                // Multi-proof encoding (MULTI_PROOF_TYPE = 5).
-                // The MultiProofVerifier requires BOTH proofs to pass.
-                // Layout:
-                // [0] = MULTI_PROOF_TYPE | (verifier_version << 8)
-                // [1] = 0 (previous hash)
-                // [2] = N (number of Airbender proof elements)
-                // [3 .. 3+N] = Airbender SNARK proof elements
-                // [3+N .. 3+N+24] = ZiSK SNARK proof (24 uint256s)
-                // [3+N+24 .. 3+N+32] = ZiSK public values (8 uint256s)
                 let mut proof_vec = vec![
                     U256::from(MULTI_PROOF_TYPE | (verifier_version << 8)),
                     U256::from(0),                    // previous hash
                     U256::from(era_chunks.len()),      // N
                 ];
-                proof_vec.extend(era_chunks);          // Airbender proof
-                proof_vec.extend(zisk_proof_chunks);   // ZiSK SNARK (24)
-                proof_vec.extend(zisk_pv_chunks);      // ZiSK public values (8)
+                proof_vec.extend(era_chunks);
+                proof_vec.extend(zisk_proof_chunks);
+                proof_vec.extend(zisk_pv_chunks);
                 proof_vec
             }
         };
@@ -276,7 +292,7 @@ impl ProofCommand {
 
         let mut proof_data = vec![SUPPORTED_ENCODING_VERSION];
         proof_payload.abi_encode_raw(&mut proof_data);
-        proof_data
+        Ok(proof_data)
     }
 }
 
