@@ -63,12 +63,15 @@ pub enum ZiskSubmitError {
     DownstreamClosed,
 }
 
+/// Inner state protected by a single mutex to avoid lock ordering issues.
+struct ZiskJobState {
+    pending: HashMap<u64, ZiskJobData>,
+    assigned: HashMap<u64, (String, std::time::Instant, ZiskJobData)>,
+}
+
 /// Manages ZiSK SNARK proof jobs with pick/submit assignment model.
 pub struct ZiskJobManager {
-    /// Pending ZiSK jobs awaiting prover assignment (batch_number → job data).
-    pending_jobs: Mutex<HashMap<u64, ZiskJobData>>,
-    /// Jobs currently assigned to provers (batch_number → (prover_id, assigned_at, job_data)).
-    assigned_jobs: Mutex<HashMap<u64, (String, std::time::Instant, ZiskJobData)>>,
+    state: Mutex<ZiskJobState>,
     /// Assignment timeout — if a prover doesn't submit within this, the job is reassigned.
     assignment_timeout: Duration,
     /// Channel to send completed multi-proofs downstream.
@@ -87,8 +90,10 @@ impl ZiskJobManager {
             GenericComponentState::ProcessingOrWaitingRecv,
         );
         Self {
-            pending_jobs: Mutex::new(HashMap::new()),
-            assigned_jobs: Mutex::new(HashMap::new()),
+            state: Mutex::new(ZiskJobState {
+                pending: HashMap::new(),
+                assigned: HashMap::new(),
+            }),
             assignment_timeout,
             prove_sender,
             latency_tracker,
@@ -96,14 +101,11 @@ impl ZiskJobManager {
     }
 
     /// Add a batch ready for ZiSK proving.
-    ///
-    /// Called by `SnarkJobManager::submit_proof` when an Airbender SNARK arrives
-    /// and ZiSK data is available. Returns `Ok(())` on success, or
-    /// `Err(job_data)` if the queue is full (caller can fall back to Airbender-only).
     pub async fn add_job(&self, batch_number: u64, job_data: ZiskJobData) -> Result<(), ZiskJobData> {
-        let pending_count = self.pending_jobs.lock().await.len();
-        let assigned_count = self.assigned_jobs.lock().await.len();
-        if pending_count + assigned_count >= MAX_TOTAL_JOBS {
+        let mut state = self.state.lock().await;
+        if state.pending.len() + state.assigned.len() >= MAX_TOTAL_JOBS {
+            let pending_count = state.pending.len();
+            let assigned_count = state.assigned.len();
             tracing::error!(
                 batch = batch_number,
                 pending = pending_count,
@@ -120,41 +122,31 @@ impl ZiskJobManager {
             era_proof_bytes = job_data.era_proof.len(),
             "ZiSK job added"
         );
-        self.pending_jobs.lock().await.insert(batch_number, job_data);
+        state.pending.insert(batch_number, job_data);
         Ok(())
     }
 
     /// Pick the next available ZiSK job for a prover.
-    ///
-    /// Returns the oldest pending job or a timed-out assigned job.
-    /// Marks the job as assigned to the given prover_id.
     pub async fn pick_next_job(&self, prover_id: &str) -> Option<ZiskJob> {
         let now = std::time::Instant::now();
+        let mut state = self.state.lock().await;
 
-        // First check for timed-out assigned jobs.
-        {
-            let mut assigned = self.assigned_jobs.lock().await;
-            let timed_out: Vec<u64> = assigned
-                .iter()
-                .filter(|(_, (_, assigned_at, _))| now.duration_since(*assigned_at) >= self.assignment_timeout)
-                .map(|(&batch, _)| batch)
-                .collect();
-            for batch in timed_out {
-                if let Some((old_prover, _, data)) = assigned.remove(&batch) {
-                    tracing::warn!(
-                        batch,
-                        old_prover,
-                        "ZiSK job assignment timed out, returning to pending"
-                    );
-                    self.pending_jobs.lock().await.insert(batch, data);
-                }
+        // Return timed-out assigned jobs to pending.
+        let timed_out: Vec<u64> = state.assigned
+            .iter()
+            .filter(|(_, (_, assigned_at, _))| now.duration_since(*assigned_at) >= self.assignment_timeout)
+            .map(|(&batch, _)| batch)
+            .collect();
+        for batch in timed_out {
+            if let Some((old_prover, _, data)) = state.assigned.remove(&batch) {
+                tracing::warn!(batch, old_prover, "ZiSK job timed out, returning to pending");
+                state.pending.insert(batch, data);
             }
         }
 
-        // Pick oldest pending job.
-        let mut pending = self.pending_jobs.lock().await;
-        let batch_number = *pending.keys().min()?;
-        let job_data = pending.remove(&batch_number)?;
+        // Pick oldest pending.
+        let batch_number = *state.pending.keys().min()?;
+        let job_data = state.pending.remove(&batch_number)?;
 
         let vk_hash = job_data
             .batches
@@ -162,17 +154,12 @@ impl ZiskJobManager {
             .and_then(|b| b.batch.verification_key_hash().ok())
             .map(|h| format!("0x{h}"))
             .unwrap_or_else(|| {
-                tracing::warn!(batch = batch_number, "VK hash missing from batch metadata");
+                tracing::warn!(batch = batch_number, "VK hash missing");
                 String::new()
             });
 
         let zisk_data = job_data.zisk_data.clone();
-
-        // Mark as assigned.
-        self.assigned_jobs
-            .lock()
-            .await
-            .insert(batch_number, (prover_id.to_string(), now, job_data));
+        state.assigned.insert(batch_number, (prover_id.to_string(), now, job_data));
 
         tracing::info!(
             batch = batch_number,
@@ -215,8 +202,8 @@ impl ZiskJobManager {
 
         // Remove from assigned jobs.
         let job_data = {
-            let mut assigned = self.assigned_jobs.lock().await;
-            match assigned.remove(&batch_number) {
+            let mut state = self.state.lock().await;
+            match state.assigned.remove(&batch_number) {
                 Some((_, _, data)) => data,
                 None => return Err(ZiskSubmitError::UnknownJob(batch_number)),
             }
@@ -249,7 +236,7 @@ impl ZiskJobManager {
                         "ZiSK proof commitment does not match batch commitment"
                     );
                     // Return job to pending so it can be retried
-                    self.pending_jobs.lock().await.insert(batch_number, job_data);
+                    self.state.lock().await.pending.insert(batch_number, job_data);
                     return Err(ZiskSubmitError::CommitmentMismatch);
                 }
             }
@@ -299,7 +286,7 @@ impl ZiskJobManager {
                     batch = batch_number,
                     "downstream channel closed, returning ZiSK job to pending queue"
                 );
-                self.pending_jobs.lock().await.insert(batch_number, recovered);
+                self.state.lock().await.pending.insert(batch_number, recovered);
             }
             return Err(ZiskSubmitError::DownstreamClosed);
         }
@@ -311,7 +298,7 @@ impl ZiskJobManager {
 
     /// Check if there are pending or assigned ZiSK jobs.
     pub async fn has_pending_jobs(&self) -> bool {
-        !self.pending_jobs.lock().await.is_empty()
-            || !self.assigned_jobs.lock().await.is_empty()
+        let state = self.state.lock().await;
+        !state.pending.is_empty() || !state.assigned.is_empty()
     }
 }

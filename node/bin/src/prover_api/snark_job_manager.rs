@@ -27,6 +27,9 @@ pub struct SnarkJobManager {
     max_fris_per_snark: usize,
     zisk_data_cache: Option<Arc<ZiskDataCache>>,
     zisk_job_manager: Option<Arc<ZiskJobManager>>,
+    /// When true, refuse to send Airbender-only proofs if ZiSK data was expected.
+    /// Prevents silent fallback to single-proof mode when ZiSK provers are offline.
+    require_multi_proof: bool,
     latency_tracker: ComponentStateHandle<GenericComponentState>,
 }
 
@@ -52,6 +55,7 @@ impl SnarkJobManager {
             max_fris_per_snark,
             zisk_data_cache: None,
             zisk_job_manager: None,
+            require_multi_proof: false,
             latency_tracker,
         }
     }
@@ -59,6 +63,12 @@ impl SnarkJobManager {
     /// Set the ZiSK data cache for multi-proof composition.
     pub fn set_zisk_data_cache(&mut self, cache: Arc<ZiskDataCache>) {
         self.zisk_data_cache = Some(cache);
+    }
+
+    /// When true, batches with ZiSK data will NOT fall back to Airbender-only.
+    /// They will be held until the ZiSK prover processes them.
+    pub fn set_require_multi_proof(&mut self, require: bool) {
+        self.require_multi_proof = require;
     }
 
     /// Set the ZiSK job manager for routing Airbender SNARKs to multi-proof composition.
@@ -208,6 +218,13 @@ impl SnarkJobManager {
         payload: Vec<u8>,
         proving_version: ProvingVersion,
     ) -> anyhow::Result<()> {
+        if self.require_multi_proof && self.zisk_data_cache.is_some() {
+            let batch_num = batches.first().map(|b| b.batch_number()).unwrap_or(0);
+            anyhow::bail!(
+                "multi_proof_verifier is required but ZiSK proof unavailable for batch {batch_num}. \
+                 The batch cannot be submitted as Airbender-only. Check ZiSK prover status."
+            );
+        }
         let batches: Vec<_> = batches
             .into_iter()
             .map(|b| b.with_stage(BatchExecutionStage::SnarkProvedReal))

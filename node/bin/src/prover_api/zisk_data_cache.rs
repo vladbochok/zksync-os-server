@@ -57,14 +57,19 @@ impl ZiskDataCache {
     }
 
     /// Store ZiSK data for a batch. Called when the batch enters the FRI proving pipeline.
-    /// Evicts expired and overflow entries.
+    ///
+    /// Eviction is lazy: only triggered when cache exceeds `max_entries`,
+    /// not on every insert.
     pub async fn insert(&self, batch_number: u64, data: Vec<u8>) {
         let mut cache = self.inner.lock().await;
         cache.insert(batch_number, CacheEntry {
             data,
             inserted_at: Instant::now(),
         });
-        Self::evict(&mut cache, self.max_entries, self.max_age);
+        // Only evict when over capacity — avoids O(n) scan on every insert.
+        if cache.len() > self.max_entries {
+            Self::evict(&mut cache, self.max_entries, self.max_age);
+        }
     }
 
     /// Check whether ZiSK data exists for a batch (non-destructive).

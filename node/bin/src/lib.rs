@@ -1020,6 +1020,7 @@ async fn run_main_node_pipeline(
             config.prover_api_config.snark_job_timeout,
             config.prover_api_config.max_assigned_batch_range,
             zisk_data_cache,
+            config.prover_input_generator_config.multi_proof_verifier,
         )
     } else {
         SnarkProvingPipelineStep::new(

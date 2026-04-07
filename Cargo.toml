@@ -304,4 +304,4 @@ lto = "fat"
 codegen-units = 1
 
 [patch."https://github.com/vladbochok/zksync-os-revm"]
-zksync-os-revm = { path = "/tmp/zksync-os-revm-patched" }
+zksync-os-revm = { path = "../zksync-os-revm-local" }

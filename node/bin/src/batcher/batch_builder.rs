@@ -208,9 +208,10 @@ fn assemble_zisk_batch(
 
     let mut block_data_vec = Vec::with_capacity(blocks.len());
     for (_, _, _, pi) in blocks {
-        let bytes = pi.zisk_data().expect("ZiSK data missing from ProverInput");
+        let bytes = pi.zisk_data()
+            .ok_or_else(|| anyhow::anyhow!("ZiSK data missing from ProverInput"))?;
         let data: ZiskBlockData = bincode1::deserialize(bytes)
-            .expect("failed to deserialize ZiSK BlockData");
+            .map_err(|e| anyhow::anyhow!("failed to deserialize ZiSK BlockData: {e}"))?;
         block_data_vec.push(data);
     }
 
