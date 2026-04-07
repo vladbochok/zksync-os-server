@@ -209,36 +209,22 @@ impl ZiskJobManager {
             }
         };
 
-        // Validate batch commitment: first 32 bytes of ZiSK public values
-        // must match the batch commitment derived from the Airbender proof's
-        // batch metadata. This catches honest-but-buggy provers early,
-        // avoiding wasted gas on L1.
-        if public_values.len() >= 32 {
-            let zisk_commitment = alloy::primitives::B256::from_slice(&public_values[..32]);
-            // Compute expected commitment from batch metadata
-            if let Some(first_batch) = job_data.batches.first() {
-                let stored = first_batch
-                    .batch
-                    .batch_info
-                    .clone()
-                    .into_stored(&first_batch.batch.protocol_version);
-                let prev = &first_batch.batch.previous_stored_batch_info;
-                let mut bytes = Vec::with_capacity(96);
-                bytes.extend_from_slice(prev.state_commitment.as_slice());
-                bytes.extend_from_slice(stored.state_commitment.as_slice());
-                bytes.extend_from_slice(stored.commitment.as_slice());
-                let expected = alloy::primitives::keccak256(&bytes);
-                if zisk_commitment != expected {
-                    tracing::error!(
-                        batch = batch_number,
-                        zisk = %zisk_commitment,
-                        expected = %expected,
-                        "ZiSK proof commitment does not match batch commitment"
-                    );
-                    // Return job to pending so it can be retried
-                    self.state.lock().await.pending.insert(batch_number, job_data);
-                    return Err(ZiskSubmitError::CommitmentMismatch);
-                }
+        // Validate batch commitment using the shared verifier.
+        if let Some(first_batch) = job_data.batches.first() {
+            let stored = first_batch
+                .batch
+                .batch_info
+                .clone()
+                .into_stored(&first_batch.batch.protocol_version);
+            let prev = &first_batch.batch.previous_stored_batch_info;
+            if let Err(msg) = crate::prover_api::zisk_proof_verifier::verify_zisk_snark_public_values(
+                &prev.state_commitment,
+                &stored,
+                &public_values,
+            ) {
+                tracing::error!(batch = batch_number, "{msg}");
+                self.state.lock().await.pending.insert(batch_number, job_data);
+                return Err(ZiskSubmitError::CommitmentMismatch);
             }
         }
 

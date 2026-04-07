@@ -284,39 +284,15 @@ impl FriJobManager {
                 todo!("verifying v7 proofs is unsupported for now")
             }
             ProvingVersion::ZiskV1 => {
-                // ZiSK proof verification:
-                //
-                // Full STARK proof verification (polynomial commitments, FRI queries)
-                // requires the ZiSK verifier library which is not yet available as a
-                // Rust crate. The L1 contract is the final safety net.
-                //
-                // Server-side we verify:
-                // 1. Proof is non-empty (basic sanity)
-                // 2. The batch commitment from the server matches what the prover should
-                //    have proven (defense against submitting proofs for wrong batches)
-                //
-                // TODO(zisk): Integrate ZiSK STARK verifier library for full server-side
-                // proof verification once cargo-zisk exposes a verify API.
-                let expected_commitment = batch_metadata
-                    .batch_info
-                    .clone()
-                    .into_stored(&batch_metadata.protocol_version)
-                    .commitment;
-
-                if proof_bytes.is_empty() {
-                    tracing::warn!(batch_number, "ZiSK proof is empty");
-                    return Err(SubmitError::Other(
-                        "ZiSK proof bytes are empty".to_string(),
-                    ));
-                }
-
-                tracing::info!(
-                    batch_number,
-                    ?expected_commitment,
-                    proof_len = proof_bytes.len(),
-                    "ZiSK proof received; commitment verified, STARK verification delegated to L1"
-                );
-                Ok(())
+                use crate::prover_api::zisk_proof_verifier;
+                zisk_proof_verifier::verify_zisk_proof(
+                    batch_metadata.previous_stored_batch_info.state_commitment,
+                    batch_metadata
+                        .batch_info
+                        .clone()
+                        .into_stored(&batch_metadata.protocol_version),
+                    proof_bytes,
+                )
             }
         };
 

@@ -13,3 +13,4 @@ pub mod snark_proving_pipeline_step;
 pub mod zisk_data_cache;
 pub mod zisk_job_manager;
 pub mod zisk_proof_constants;
+pub mod zisk_proof_verifier;
