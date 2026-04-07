@@ -13928,16 +13928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zksync-os-revm"
-version = "0.1.0"
-source = "git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4#616c36089058a7d86e9c5af0c668ebefa2230668"
-dependencies = [
- "auto_impl",
- "revm",
- "serde",
-]
-
-[[package]]
 name = "zksync-os-zisk-lib"
 version = "0.1.0"
 dependencies = [
@@ -13949,7 +13939,7 @@ dependencies = [
  "revm",
  "serde",
  "tiny-keccak",
- "zksync-os-revm 0.1.0",
+ "zksync-os-revm",
 ]
 
 [[package]]
@@ -14556,7 +14546,7 @@ dependencies = [
  "tracing",
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
- "zksync-os-revm 0.1.0 (git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4)",
+ "zksync-os-revm",
  "zksync_os_genesis",
  "zksync_os_interface",
  "zksync_os_internal_config",
@@ -14719,7 +14709,7 @@ dependencies = [
  "tracing",
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
- "zksync-os-revm 0.1.0",
+ "zksync-os-revm",
  "zksync_os_gas_adjuster",
  "zksync_os_genesis",
  "zksync_os_interface",
@@ -14769,7 +14759,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
  "smart-config",
  "smart-config-commands",
  "tar",
@@ -14782,7 +14771,7 @@ dependencies = [
  "vise",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=dev-20260320-1)",
  "zk_ee 0.1.0 (git+https://github.com/matter-labs/zksync-os?tag=v0.2.9-interface-v0.0.14)",
- "zksync-os-revm 0.1.0 (git+https://github.com/matter-labs/zksync-os-revm?tag=v0.0.4)",
+ "zksync-os-revm",
  "zksync-os-zisk-lib",
  "zksync_os_base_token_adjuster",
  "zksync_os_batch_types",

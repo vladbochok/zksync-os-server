@@ -303,5 +303,11 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 
+# Both matter-labs (workspace dep) and vladbochok (zisk-lib dep) are patched to
+# the same local checkout. On CI, replace with the pushed git branch:
+#   git = "https://github.com/vladbochok/zksync-os-revm", branch = "vb/second-proof-system"
+[patch."https://github.com/matter-labs/zksync-os-revm"]
+zksync-os-revm = { path = "../zksync-os-revm-local" }
+
 [patch."https://github.com/vladbochok/zksync-os-revm"]
 zksync-os-revm = { path = "../zksync-os-revm-local" }
