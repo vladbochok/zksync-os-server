@@ -53,7 +53,19 @@ pub fn verify_zisk_snark_public_values(
         ));
     }
 
-    let zisk_commitment = B256::from_slice(&public_values[..32]);
+    // ZiSK public values are written via ziskos::io::commit() which stores
+    // each 4-byte chunk as a u32 LE value. When serialized to the SNARK's
+    // public values bytes, each 4-byte word is byte-swapped relative to the
+    // raw keccak256 output. Undo the swap to recover the original commitment.
+    let mut commitment_bytes = [0u8; 32];
+    for i in 0..8 {
+        let offset = i * 4;
+        commitment_bytes[offset] = public_values[offset + 3];
+        commitment_bytes[offset + 1] = public_values[offset + 2];
+        commitment_bytes[offset + 2] = public_values[offset + 1];
+        commitment_bytes[offset + 3] = public_values[offset];
+    }
+    let zisk_commitment = B256::from_slice(&commitment_bytes);
     let expected = compute_batch_commitment(
         previous_state_commitment,
         &stored_batch_info.state_commitment,
