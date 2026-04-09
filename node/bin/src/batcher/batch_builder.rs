@@ -309,16 +309,25 @@ fn assemble_zisk_batch(
             tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
         },
         blocks: block_data_vec
-            .into_iter()
+            .iter()
             .map(|d| {
-                let mut bi = d.block_input;
-                // Set per-block tree root so the executor verifies each block's
-                // merkle proofs against the correct tree version.
+                let mut bi = d.block_input.clone();
                 bi.expected_tree_root = d.tree_root_before;
-                bi.force_deploy_bytecodes = d.force_deploy_bytecodes;
                 bi
             })
             .collect(),
+        bytecodes: {
+            let mut seen = std::collections::HashSet::new();
+            let mut all_bytecodes = Vec::new();
+            for d in &block_data_vec {
+                for (hash, code) in &d.bytecodes {
+                    if seen.insert(*hash) {
+                        all_bytecodes.push((*hash, code.clone()));
+                    }
+                }
+            }
+            all_bytecodes
+        },
     };
 
     let serialized = bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");

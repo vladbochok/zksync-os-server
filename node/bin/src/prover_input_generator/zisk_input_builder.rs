@@ -43,9 +43,8 @@ pub struct ZiskBlockData {
     pub block_number_before: u64,
     pub previous_block_timestamp: u64,
     pub tree_update: Option<BatchTreeUpdate>,
-    /// Force-deploy bytecodes keyed by ZKsync blake2s hash.
-    /// Populated from block_output.published_preimages and replay_record.force_preimages.
-    pub force_deploy_bytecodes: Vec<(B256, Vec<u8>)>,
+    /// All bytecodes needed for this block's execution, keyed by keccak256 hash.
+    pub bytecodes: Vec<(B256, Vec<u8>)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,12 +108,12 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     // For upgrade txs: pre-create accounts that are force-deployed in this block.
     let has_upgrade = transactions.iter().any(|tx| tx.tx_type == 0x7e);
-    let mut force_deploy_bytecodes_extra = Vec::new();
+    let mut bytecodes_extra = Vec::new();
     if has_upgrade {
         pre_create_upgrade_accounts(
             block_output, block_number, read_state, &mut state_view,
             &mut accounts_map, &mut bytecodes_map, &mut bytecodes_out,
-            &mut force_deploy_bytecodes_extra,
+            &mut bytecodes_extra,
         )?;
 
         // Scan upgrade tx calldata for bytecode hashes and resolve from preimage DB.
@@ -144,7 +143,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                         );
                         let bytecode = Bytecode::new_raw(Bytes::copy_from_slice(&preimage));
                         bytecodes_map.insert(hash, bytecode);
-                        force_deploy_bytecodes_extra.push((hash, preimage));
+                        bytecodes_extra.push((hash, preimage));
                         calldata_resolved += 1;
                     }
                 }
@@ -191,7 +190,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             if !bytecodes_map.contains_key(&hash) {
                 bytecodes_map.insert(hash, Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
             }
-            force_deploy_bytecodes_extra.push((hash, preimage));
+            bytecodes_extra.push((hash, preimage));
         }
 
         let new_keys = read_keys.difference(&all_storage_read_keys).count();
@@ -272,7 +271,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                                     });
                                     // Store full preimage (code+artifacts) under blake2s hash
                                     // for deployer precompile.
-                                    force_deploy_bytecodes_extra.push((pre_hash, full_preimage));
+                                    bytecodes_extra.push((pre_hash, full_preimage));
                                 }
                             }
                         }
@@ -384,24 +383,29 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
                 }
                 all_storage
             },
-            bytecodes: bytecodes_out,
             block_hashes,
             l2_to_l1_logs,
             expected_tree_root: root_hash,
-            force_deploy_bytecodes: vec![], // populated by batch_builder from ZiskBlockData
         },
         tree_root_before: root_hash,
         leaf_count_before: leaf_count,
         block_number_before: block_number.saturating_sub(1),
         previous_block_timestamp: replay_record.previous_block_timestamp,
         tree_update,
-        force_deploy_bytecodes: block_output
-            .published_preimages
-            .iter()
-            .chain(&replay_record.force_preimages)
-            .map(|(h, c)| (*h, c.clone()))
-            .chain(force_deploy_bytecodes_extra.into_iter())
-            .collect(),
+        bytecodes: {
+            // Merge keccak-keyed bytecodes with blake2s-keyed force-deploy bytecodes
+            // into a single list. The deployer precompile looks up by blake2s hash,
+            // while regular contracts use keccak256. Both go into the same bytecodes map.
+            let mut all = bytecodes_out;
+            for entry in block_output.published_preimages.iter()
+                .chain(&replay_record.force_preimages)
+                .map(|(h, c)| (*h, c.clone()))
+                .chain(bytecodes_extra.into_iter())
+            {
+                all.push(entry);
+            }
+            all
+        },
     })
 }
 
@@ -1111,7 +1115,7 @@ struct TrackingDB<'a, S> {
     /// Storage reads captured during pre-execution: (address, slot, value).
     read_storage: &'a RefCell<Vec<(Address, U256, U256)>>,
     /// Bytecode preimages resolved from state_view during pre-execution.
-    /// These need to be included in force_deploy_bytecodes.
+    /// These need to be included in extra_bytecodes.
     resolved_preimages: &'a RefCell<Vec<(B256, Vec<u8>)>>,
 }
 
@@ -1197,6 +1201,10 @@ impl<S: ViewState> DatabaseRef for TrackingDB<'_, S> {
         };
         // Capture read for SimpleDB storage population
         self.read_storage.borrow_mut().push((address, index, val));
+        // DEBUG: print storage reads for upgrade-related addresses
+        if address.as_slice()[18] >= 0x80 || (address.as_slice()[16] == 0x00 && address.as_slice()[17] == 0x01) {
+            tracing::debug!("SLOAD({address}, slot={index}) = 0x{val:064x}");
+        }
         Ok(val)
     }
 
@@ -1277,7 +1285,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
     accounts_map: &mut HashMap<Address, AccountInfo>,
     bytecodes_map: &mut HashMap<B256, Bytecode>,
     bytecodes_out: &mut Vec<(B256, Vec<u8>)>,
-    force_deploy_bytecodes: &mut Vec<(B256, Vec<u8>)>,
+    extra_bytecodes: &mut Vec<(B256, Vec<u8>)>,
 ) -> anyhow::Result<()> {
     // Pre-create all addresses from storage writes and account diffs.
     for write in &block_output.storage_writes {
@@ -1340,7 +1348,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                             preimage_len = padded_code_with_artifacts.len(),
                             "storing force_deploy_bytecode (blake2s → preimage)"
                         );
-                        force_deploy_bytecodes.push((pre_hash, padded_code_with_artifacts));
+                        extra_bytecodes.push((pre_hash, padded_code_with_artifacts));
                     }
                 }
                 accounts_map.insert(addr, AccountInfo {
@@ -1368,7 +1376,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                         if !bytecodes_map.contains_key(hash) {
                             bytecodes_map.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(&preimage)));
                         }
-                        force_deploy_bytecodes.push((*hash, preimage));
+                        extra_bytecodes.push((*hash, preimage));
                         deployer_resolved += 1;
                     }
                 }
@@ -1379,7 +1387,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         }
     }
 
-    // Include ALL published_preimages as force_deploy_bytecodes.
+    // Include ALL published_preimages as extra_bytecodes.
     // Published preimages include both AccountProperties (short, ~124 bytes) and
     // actual bytecodes (long, thousands of bytes). The deployer precompile's
     // setDeployedCodeEVM uses the blake2s hash to look up bytecodes.
@@ -1389,12 +1397,12 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
         for (hash, data) in &block_output.published_preimages {
             if !data.is_empty() && !bytecodes_map.contains_key(hash) {
                 bytecodes_map.insert(*hash, Bytecode::new_raw(Bytes::copy_from_slice(data)));
-                force_deploy_bytecodes.push((*hash, data.clone()));
+                extra_bytecodes.push((*hash, data.clone()));
                 extra_from_published += 1;
             }
         }
         if extra_from_published > 0 {
-            tracing::info!(extra_from_published, "included published_preimages as force_deploy_bytecodes");
+            tracing::info!(extra_from_published, "included published_preimages as extra_bytecodes");
         }
     }
 
@@ -1438,7 +1446,7 @@ fn pre_create_upgrade_accounts<ReadState: ReadStateHistory>(
                 if let Some(code_preimage) = state_for_bytecodes.get_preimage(bytecode_hash) {
                     if !code_preimage.is_empty() {
                         bytecodes_map.insert(bytecode_hash, Bytecode::new_raw(Bytes::copy_from_slice(&code_preimage)));
-                        force_deploy_bytecodes.push((bytecode_hash, code_preimage));
+                        extra_bytecodes.push((bytecode_hash, code_preimage));
                         resolved_count += 1;
                     }
                 }
