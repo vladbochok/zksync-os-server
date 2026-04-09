@@ -354,6 +354,22 @@ fn assemble_zisk_batch(
             ),
             Err(e) => tracing::warn!("Failed to dump ZiSK data: {e}"),
         }
+
+        // Run native executor and dump the commitment for verification
+        match zksync_os_zisk_lib::executor::execute_and_commit_from_bincode(&serialized) {
+            Ok((_output, commitment)) => {
+                let commitment_path = path.join(format!("batch_{batch_num}_commitment.hex"));
+                let _ = std::fs::write(&commitment_path, format!("{commitment}"));
+                tracing::info!(
+                    batch_num,
+                    commitment = %commitment,
+                    "ZiSK native commitment computed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(batch_num, error = %e, "ZiSK native execution failed");
+            }
+        }
     }
 
     Ok(serialized)
