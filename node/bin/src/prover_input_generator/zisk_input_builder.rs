@@ -309,21 +309,8 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     let storage_reads = all_storage_reads;
 
     // Phase 2: extract merkle proofs for all accessed keys
-    let (mut accounts_out, account_preimages, mut storage_proofs) =
+    let (account_preimages, mut storage_proofs) =
         extract_account_proofs(&all_addrs, &mut tree, &mut state_view);
-
-    // Override code_hash for accounts resolved from post-execution state by pre_create_upgrade_accounts.
-    // The pre-execution state has observable_bytecode_hash=0 for force-deployed system contracts,
-    // but accounts_map has the correct code_hash from the post-execution resolution.
-    for (addr, account_data) in &mut accounts_out {
-        if account_data.code_hash.is_zero() {
-            if let Some(info) = accounts_map.get(addr) {
-                if info.code_hash != KECCAK_EMPTY && info.code_hash != B256::ZERO {
-                    account_data.code_hash = info.code_hash;
-                }
-            }
-        }
-    }
 
     let mut proven_flat_keys: HashSet<B256> = storage_proofs.iter().map(|(k, _)| *k).collect();
 
@@ -370,7 +357,6 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             storage_proofs,
             account_preimages,
             transactions,
-            accounts: accounts_out,
             storage: {
                 // Merge write prestates with read values from pre-execution.
                 // This ensures REVM's SimpleDB has both read and write slot values.
@@ -606,8 +592,7 @@ fn extract_account_proofs(
     addrs: &[Address],
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
     state_view: &mut impl ViewState,
-) -> (Vec<(Address, AccountData)>, Vec<(Address, Vec<u8>)>, Vec<(B256, StorageProof)>) {
-    let mut accounts_out = Vec::new();
+) -> (Vec<(Address, Vec<u8>)>, Vec<(B256, StorageProof)>) {
     let mut preimages = Vec::new();
     let mut proofs = Vec::new();
 
@@ -616,23 +601,13 @@ fn extract_account_proofs(
         let proof = extract_proof(tree, flat_key);
         proofs.push((flat_key, proof));
 
-        if let Some(props) = state_view.get_account(addr) {
-            accounts_out.push((addr, AccountData {
-                nonce: props.nonce, balance: props.balance,
-                code_hash: B256::from(props.observable_bytecode_hash.as_u8_array()),
-            }));
-            if let Some(hash_value) = ReadStorage::read(state_view, flat_key) {
-                if let Some(preimage) = state_view.get_preimage(hash_value) {
-                    preimages.push((addr, preimage));
-                }
+        if let Some(hash_value) = ReadStorage::read(state_view, flat_key) {
+            if let Some(preimage) = state_view.get_preimage(hash_value) {
+                preimages.push((addr, preimage));
             }
-        } else {
-            accounts_out.push((addr, AccountData {
-                nonce: 0, balance: U256::ZERO, code_hash: B256::ZERO,
-            }));
         }
     }
-    (accounts_out, preimages, proofs)
+    (preimages, proofs)
 }
 
 fn extract_storage_write_proofs(
