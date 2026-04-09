@@ -305,12 +305,13 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
     }
 
     let mut state_view = read_state.state_view_at(block_number - 1)?;
+    let mut state_view_post = Some(read_state.state_view_at(block_number)?);
     let storage_read_keys = all_storage_read_keys;
     let storage_reads = all_storage_reads;
 
     // Phase 2: extract merkle proofs for all accessed keys
     let (account_preimages, mut storage_proofs) =
-        extract_account_proofs(&all_addrs, &mut tree, &mut state_view);
+        extract_account_proofs(&all_addrs, &mut tree, &mut state_view, &mut state_view_post);
 
     let mut proven_flat_keys: HashSet<B256> = storage_proofs.iter().map(|(k, _)| *k).collect();
 
@@ -421,6 +422,13 @@ fn collect_touched_addresses(
         if let Some(to) = tx.to() { push(to, &mut seen, &mut addrs); }
     }
     push(coinbase, &mut seen, &mut addrs);
+    // REVM calls basic_ref on precompile addresses during CALL (for balance checks),
+    // even though the precompile intercepts execution later. Include them explicitly.
+    for sys in [0x8006u64, 0x8008, 0x800a] {
+        let mut bytes = [0u8; 20];
+        bytes[18..].copy_from_slice(&(sys as u16).to_be_bytes());
+        push(Address::from(bytes), &mut seen, &mut addrs);
+    }
     for diff in &block_output.account_diffs {
         push(diff.address, &mut seen, &mut addrs);
     }
@@ -588,10 +596,11 @@ fn pre_execute_for_reads(
 // Phase 2: Merkle proof extraction
 // ---------------------------------------------------------------------------
 
-fn extract_account_proofs(
+fn extract_account_proofs<S1: ViewState, S2: ViewState>(
     addrs: &[Address],
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
-    state_view: &mut impl ViewState,
+    state_view: &mut S1,
+    state_view_post: &mut Option<S2>,
 ) -> (Vec<(Address, Vec<u8>)>, Vec<(B256, StorageProof)>) {
     let mut preimages = Vec::new();
     let mut proofs = Vec::new();
@@ -602,8 +611,18 @@ fn extract_account_proofs(
         proofs.push((flat_key, proof));
 
         if let Some(hash_value) = ReadStorage::read(state_view, flat_key) {
-            if let Some(preimage) = state_view.get_preimage(hash_value) {
+            // Try pre-execution state first, fall back to post-execution state.
+            // Some system contracts have preimages only in the post-execution state
+            // (e.g. force-deployed contracts in genesis/upgrade blocks).
+            let preimage = state_view.get_preimage(hash_value)
+                .or_else(|| state_view_post.as_mut().and_then(|sv| sv.get_preimage(hash_value)));
+            if let Some(preimage) = preimage {
                 preimages.push((addr, preimage));
+            } else {
+                tracing::warn!(
+                    addr = %addr, hash = %hash_value,
+                    "account exists in tree but no preimage found in pre or post-execution state"
+                );
             }
         }
     }
