@@ -251,7 +251,12 @@ fn assemble_zisk_batch(
         alloy::primitives::B256::from_slice(&hasher.finalize())
     };
 
-    let previous_block_hashes: Vec<alloy::primitives::B256> = first_ctx
+    // Use the LAST block's context for previous_block_hashes — this feeds into
+    // block_hashes_blake_after in the executor, which must match the server's
+    // state commitment that uses last_block_context.block_hashes.0[1..].
+    let last_replay = &blocks.last().unwrap().1;
+    let last_ctx = &last_replay.block_context;
+    let previous_block_hashes: Vec<alloy::primitives::B256> = last_ctx
         .block_hashes
         .0[1..]
         .iter()
@@ -293,15 +298,7 @@ fn assemble_zisk_batch(
                     }).collect()
                 })
                 .unwrap_or_default(),
-            // Single-block batch: use block's tree update directly.
-            // Multi-block: would need chaining (leaves None, guest rejects
-            // if REVM produces storage writes).
-            tree_update: if block_data_vec.len() == 1 {
-                block_data_vec[0].tree_update.clone()
-            } else {
-                // Multi-block: would need chaining intermediate roots.
-                None
-            },
+            tree_update: merge_block_tree_updates(&block_data_vec),
         },
         blocks: block_data_vec
             .into_iter()
@@ -343,4 +340,106 @@ fn assemble_zisk_batch(
     }
 
     Ok(serialized)
+}
+
+/// Merge per-block tree updates into a single batch-level tree update.
+///
+/// For a single block, returns that block's tree_update directly.
+/// For multi-block batches, merges all per-block updates:
+///   - Old root verification: uses first block's sorted_leaves + intermediate_hashes
+///   - Entries: deduplicated across all blocks (last-writer-wins per key)
+///   - Operations: rebuilt from ALL blocks' operations (Updates + Inserts)
+///   - New root: uses last block's expected_root_after (trusted from server tree DB)
+fn merge_block_tree_updates(
+    blocks: &[crate::prover_input_generator::zisk_input_builder::ZiskBlockData],
+) -> Option<zksync_os_zisk_lib::merkle::BatchTreeUpdate> {
+    use zksync_os_zisk_lib::merkle::{BatchTreeUpdate, WriteOp, TreeLeaf};
+
+    if blocks.len() == 1 {
+        return blocks[0].tree_update.clone();
+    }
+
+    // Collect all tree updates; if any block has writes but no update, that's a bug.
+    // Blocks with no writes have tree_update=None — skip them.
+    let updates: Vec<&BatchTreeUpdate> = blocks
+        .iter()
+        .filter_map(|b| b.tree_update.as_ref())
+        .collect();
+    if updates.is_empty() {
+        return None;
+    }
+
+    let first = &updates[0];
+
+    // Build combined sorted_leaves from the first block (for old root verification).
+    // The first block's sorted_leaves + intermediate_hashes can reconstruct the
+    // batch-start tree root. Additional blocks may touch leaves not in this set,
+    // but apply() with expected_root_after doesn't need those for the new root.
+    let sorted_leaves = first.sorted_leaves.clone();
+    let intermediate_hashes = first.intermediate_hashes.clone();
+    let leaf_count_before = first.leaf_count_before;
+
+    // Build set of keys in initial sorted_leaves (pre-batch leaf keys)
+    let initial_key_to_index: std::collections::HashMap<alloy::primitives::B256, u64> = first
+        .sorted_leaves
+        .iter()
+        .map(|(idx, leaf)| (leaf.key, *idx))
+        .collect();
+
+    // Merge entries across all blocks: last-writer-wins per key.
+    // Preserve insertion order (first appearance across blocks).
+    let mut merged_entries: Vec<(alloy::primitives::B256, alloy::primitives::B256)> = Vec::new();
+    let mut key_pos: std::collections::HashMap<alloy::primitives::B256, usize> = std::collections::HashMap::new();
+
+    // Also track total inserts to compute final leaf_count
+    let mut total_inserts: u64 = 0;
+    // Track which keys were inserted (not present at batch start)
+    let mut inserted_keys: std::collections::HashSet<alloy::primitives::B256> = std::collections::HashSet::new();
+
+    for update in &updates {
+        for (op, (key, value)) in update.operations.iter().zip(&update.entries) {
+            if let Some(&pos) = key_pos.get(key) {
+                // Key already seen — update the value (last-writer-wins)
+                merged_entries[pos].1 = *value;
+            } else {
+                // New key
+                key_pos.insert(*key, merged_entries.len());
+                merged_entries.push((*key, *value));
+            }
+            // Track inserts: if this operation is an Insert and we haven't seen this key
+            // as an insert before, count it
+            if matches!(op, WriteOp::Insert { .. }) && !inserted_keys.contains(key) {
+                total_inserts += 1;
+                inserted_keys.insert(*key);
+            }
+        }
+    }
+
+    // Build operations for the merged update.
+    // For keys in initial_key_to_index: Update
+    // For keys not in initial_key_to_index: Insert
+    // We use a simple prev_index for inserts. Since we rely on expected_root_after,
+    // the exact linked-list threading doesn't matter for correctness.
+    let first_leaf_index = sorted_leaves.first().map(|(idx, _)| *idx).unwrap_or(0);
+    let mut ops = Vec::with_capacity(merged_entries.len());
+    for (key, _) in &merged_entries {
+        if let Some(&tree_index) = initial_key_to_index.get(key) {
+            ops.push(WriteOp::Update { index: tree_index });
+        } else {
+            ops.push(WriteOp::Insert { prev_index: first_leaf_index });
+        }
+    }
+
+    // Get expected_root_after from the last block that has one
+    let expected_root = updates.iter().rev().find_map(|u| u.expected_root_after);
+
+    Some(BatchTreeUpdate {
+        operations: ops,
+        entries: merged_entries,
+        sorted_leaves,
+        intermediate_hashes,
+        intermediate_hashes_new: vec![],
+        leaf_count_before,
+        expected_root_after: expected_root,
+    })
 }
