@@ -1039,12 +1039,19 @@ fn extract_l2_to_l1_logs(block_output: &BlockOutput) -> Vec<L2ToL1LogEntry> {
 fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -> Vec<TxInput> {
     transactions.iter().enumerate().filter_map(|(i, tx)| {
         let mut tx_input = convert_tx(tx)?;
-        // For upgrade txs, include the server's gas_used as override.
-        // EVM gas differs from ZKsync native gas for system transactions.
-        if tx_input.tx_type == 0x7e {
-            if let Some(Ok(result)) = block_output.tx_results.get(i) {
+        // Include the server's gas_used for all transactions.
+        // REVM's gas computation may differ from ZKsync OS native gas
+        // (especially for L1 deposits and upgrade txs), so the server's
+        // gas value is authoritative for block header computation.
+        match block_output.tx_results.get(i) {
+            Some(Ok(result)) => {
                 tx_input.gas_used_override = Some(result.gas_used);
             }
+            Some(Err(_)) => {
+                tx_input.gas_used_override = Some(0);
+                tx_input.force_fail = true;
+            }
+            None => {}
         }
         Some(tx_input)
     }).collect()
