@@ -687,7 +687,7 @@ fn get_leaf_proof(tree: &mut MerkleTreeVersion<RocksDBWrapper>, idx: u64) -> Lea
     }
 }
 
-fn build_tree_update(
+pub fn build_tree_update(
     tree: &mut MerkleTreeVersion<RocksDBWrapper>,
     tree_after: &mut MerkleTreeVersion<RocksDBWrapper>,
     writes: &[zksync_os_interface::types::StorageWrite],

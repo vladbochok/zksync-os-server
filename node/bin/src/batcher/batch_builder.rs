@@ -25,6 +25,8 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     pubdata_mode: PubdataMode,
     sl_chain_id: u64,
     read_state: &ReadState,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<BatchForSigning<ProverInput>> {
     let block_number_from = blocks.first().unwrap().1.block_context.block_number;
     let block_number_to = blocks.last().unwrap().1.block_context.block_number;
@@ -84,6 +86,8 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         multichain_root,
         sl_chain_id,
         &batch_info,
+        batch_tree_start,
+        batch_tree_end,
     )?;
 
     // Sanity check: all blocks in the batch should have the same protocol version
@@ -139,6 +143,8 @@ fn compute_batch_prover_input(
     multichain_root: alloy::primitives::B256,
     sl_chain_id: u64,
     batch_info: &BatchInfo,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_dev::run::generate_batch_proof_input as generate_batch_proof_input_dev;
@@ -181,7 +187,7 @@ fn compute_batch_prover_input(
     // If any block carries ZiSK data, assemble the batch-level ZiSK BatchInput
     let has_zisk = blocks.iter().any(|(_, _, _, pi)| pi.zisk_data().is_some());
     let zisk_data = if has_zisk {
-        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info)?)
+        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info, batch_tree_start, batch_tree_end)?)
     } else {
         None
     };
@@ -201,6 +207,8 @@ fn assemble_zisk_batch(
     multichain_root: alloy::primitives::B256,
     sl_chain_id: u64,
     batch_info: &BatchInfo,
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
 ) -> anyhow::Result<Vec<u8>> {
     use blake2::{Blake2s256, Digest};
     use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
@@ -298,7 +306,7 @@ fn assemble_zisk_batch(
                     }).collect()
                 })
                 .unwrap_or_default(),
-            tree_update: merge_block_tree_updates(&block_data_vec),
+            tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
         },
         blocks: block_data_vec
             .into_iter()
@@ -342,104 +350,57 @@ fn assemble_zisk_batch(
     Ok(serialized)
 }
 
-/// Merge per-block tree updates into a single batch-level tree update.
+/// Build a batch-level tree update directly from the batch-start and batch-end tree views.
 ///
-/// For a single block, returns that block's tree_update directly.
-/// For multi-block batches, merges all per-block updates:
-///   - Old root verification: uses first block's sorted_leaves + intermediate_hashes
-///   - Entries: deduplicated across all blocks (last-writer-wins per key)
-///   - Operations: rebuilt from ALL blocks' operations (Updates + Inserts)
-///   - New root: uses last block's expected_root_after (trusted from server tree DB)
-fn merge_block_tree_updates(
-    blocks: &[crate::prover_input_generator::zisk_input_builder::ZiskBlockData],
-) -> Option<zksync_os_zisk_lib::merkle::BatchTreeUpdate> {
-    use zksync_os_zisk_lib::merkle::{BatchTreeUpdate, WriteOp, TreeLeaf};
-
-    if blocks.len() == 1 {
-        return blocks[0].tree_update.clone();
-    }
-
-    // Collect all tree updates; if any block has writes but no update, that's a bug.
-    // Blocks with no writes have tree_update=None — skip them.
-    let updates: Vec<&BatchTreeUpdate> = blocks
-        .iter()
-        .filter_map(|b| b.tree_update.as_ref())
-        .collect();
-    if updates.is_empty() {
-        return None;
-    }
-
-    let first = &updates[0];
-
-    // Build combined sorted_leaves from the first block (for old root verification).
-    // The first block's sorted_leaves + intermediate_hashes can reconstruct the
-    // batch-start tree root. Additional blocks may touch leaves not in this set,
-    // but apply() with expected_root_after doesn't need those for the new root.
-    let sorted_leaves = first.sorted_leaves.clone();
-    let intermediate_hashes = first.intermediate_hashes.clone();
-    let leaf_count_before = first.leaf_count_before;
-
-    // Build set of keys in initial sorted_leaves (pre-batch leaf keys)
-    let initial_key_to_index: std::collections::HashMap<alloy::primitives::B256, u64> = first
-        .sorted_leaves
-        .iter()
-        .map(|(idx, leaf)| (leaf.key, *idx))
-        .collect();
-
-    // Merge entries across all blocks: last-writer-wins per key.
-    // Preserve insertion order (first appearance across blocks).
-    let mut merged_entries: Vec<(alloy::primitives::B256, alloy::primitives::B256)> = Vec::new();
-    let mut key_pos: std::collections::HashMap<alloy::primitives::B256, usize> = std::collections::HashMap::new();
-
-    // Also track total inserts to compute final leaf_count
-    let mut total_inserts: u64 = 0;
-    // Track which keys were inserted (not present at batch start)
-    let mut inserted_keys: std::collections::HashSet<alloy::primitives::B256> = std::collections::HashSet::new();
-
-    for update in &updates {
-        for (op, (key, value)) in update.operations.iter().zip(&update.entries) {
-            if let Some(&pos) = key_pos.get(key) {
-                // Key already seen — update the value (last-writer-wins)
-                merged_entries[pos].1 = *value;
+/// This is sound: it queries the actual tree state to produce merkle proofs for
+/// both the old root verification (from batch_tree_start) and the new root
+/// computation (from batch_tree_end). No trusted `expected_root_after` needed.
+fn build_batch_tree_update(
+    blocks: &[(
+        zksync_os_interface::types::BlockOutput,
+        zksync_os_storage_api::ReplayRecord,
+        zksync_os_merkle_tree::TreeBatchOutput,
+        ProverInput,
+    )],
+    batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+) -> anyhow::Result<Option<zksync_os_zisk_lib::merkle::BatchTreeUpdate>> {
+    // Collect all storage writes across all blocks, deduplicate (last-writer-wins per key)
+    let mut combined_writes: Vec<zksync_os_interface::types::StorageWrite> = Vec::new();
+    let mut seen_keys: std::collections::HashMap<alloy::primitives::B256, usize> =
+        std::collections::HashMap::new();
+    for (block_output, _, _, _) in blocks {
+        for write in &block_output.storage_writes {
+            let key = alloy::primitives::B256::from(write.key);
+            if let Some(&pos) = seen_keys.get(&key) {
+                combined_writes[pos] = write.clone();
             } else {
-                // New key
-                key_pos.insert(*key, merged_entries.len());
-                merged_entries.push((*key, *value));
-            }
-            // Track inserts: if this operation is an Insert and we haven't seen this key
-            // as an insert before, count it
-            if matches!(op, WriteOp::Insert { .. }) && !inserted_keys.contains(key) {
-                total_inserts += 1;
-                inserted_keys.insert(*key);
+                seen_keys.insert(key, combined_writes.len());
+                combined_writes.push(write.clone());
             }
         }
     }
 
-    // Build operations for the merged update.
-    // For keys in initial_key_to_index: Update
-    // For keys not in initial_key_to_index: Insert
-    // We use a simple prev_index for inserts. Since we rely on expected_root_after,
-    // the exact linked-list threading doesn't matter for correctness.
-    let first_leaf_index = sorted_leaves.first().map(|(idx, _)| *idx).unwrap_or(0);
-    let mut ops = Vec::with_capacity(merged_entries.len());
-    for (key, _) in &merged_entries {
-        if let Some(&tree_index) = initial_key_to_index.get(key) {
-            ops.push(WriteOp::Update { index: tree_index });
-        } else {
-            ops.push(WriteOp::Insert { prev_index: first_leaf_index });
-        }
+    if combined_writes.is_empty() {
+        return Ok(None);
     }
 
-    // Get expected_root_after from the last block that has one
-    let expected_root = updates.iter().rev().find_map(|u| u.expected_root_after);
+    let (mut tree_start, mut tree_end) = match (batch_tree_start, batch_tree_end) {
+        (Some(s), Some(e)) => (s, e),
+        _ => {
+            tracing::warn!("batch tree views not available, falling back to None tree_update");
+            return Ok(None);
+        }
+    };
 
-    Some(BatchTreeUpdate {
-        operations: ops,
-        entries: merged_entries,
-        sorted_leaves,
-        intermediate_hashes,
-        intermediate_hashes_new: vec![],
-        leaf_count_before,
-        expected_root_after: expected_root,
-    })
+    let leaf_count = tree_start.root_info()?.1;
+
+    Ok(Some(
+        crate::prover_input_generator::zisk_input_builder::build_tree_update(
+            &mut tree_start,
+            &mut tree_end,
+            &combined_writes,
+            leaf_count,
+        ),
+    ))
 }

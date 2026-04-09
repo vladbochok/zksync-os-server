@@ -241,6 +241,9 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
 
         let batch_number = prev_batch_info.batch_number + 1;
         let mut blocks: Vec<(BlockOutput, ReplayRecord, TreeBatchOutput, ProverInput)> = vec![];
+        // Save first/last block tree views for batch-level ZiSK tree update
+        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
+        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
         let mut accumulator = BatchInfoAccumulator::new(
             self.batcher_config.tx_per_batch_limit,
             self.pubdata_limit_bytes,
@@ -291,6 +294,13 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                                 root_hash,
                                 leaf_count,
                             };
+
+                            // Save first block's tree start (batch-level tree root before)
+                            if batch_tree_start.is_none() {
+                                batch_tree_start = Some(tree.block_start.clone());
+                            }
+                            // Always update batch_tree_end to the latest block's end
+                            batch_tree_end = Some(tree.block_end.clone());
 
                             // ---------- accumulate batch data ----------
                             accumulator.add(&block_output, &replay_record);
@@ -343,6 +353,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 .adapt_for_protocol_version(protocol_version),
             self.sl_chain_id,
             &self.read_state,
+            batch_tree_start,
+            batch_tree_end,
         )?;
         Ok(Some(batch_envelope))
     }
@@ -369,6 +381,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
         );
 
         let mut blocks: Vec<(BlockOutput, ReplayRecord, TreeBatchOutput, ProverInput)> = vec![];
+        let mut batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
+        let mut batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion> = None;
 
         let expected_block_count = existing_batch.block_count();
         // Collect all blocks in this batch
@@ -387,6 +401,11 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
                 root_hash,
                 leaf_count,
             };
+
+            if batch_tree_start.is_none() {
+                batch_tree_start = Some(tree.block_start.clone());
+            }
+            batch_tree_end = Some(tree.block_end.clone());
 
             tracing::debug!(
                 batch_number,
@@ -414,6 +433,8 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> Batcher<ReadState> {
             self.pubdata_mode,
             self.sl_chain_id,
             &self.read_state,
+            batch_tree_start,
+            batch_tree_end,
         )?;
 
         // Verify that the rebuilt batch matches the stored batch by comparing hashes
