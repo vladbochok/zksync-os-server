@@ -358,18 +358,6 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
             storage_proofs,
             account_preimages,
             transactions,
-            storage: {
-                // Merge write prestates with read values from pre-execution.
-                // This ensures REVM's SimpleDB has both read and write slot values.
-                let mut all_storage = storage_out;
-                let existing: HashSet<(Address, U256)> = all_storage.iter().map(|(a, s, _)| (*a, *s)).collect();
-                for (addr, slot, val) in &storage_reads {
-                    if !existing.contains(&(*addr, *slot)) {
-                        all_storage.push((*addr, *slot, *val));
-                    }
-                }
-                all_storage
-            },
             block_hashes,
             l2_to_l1_logs,
             expected_tree_root: root_hash,
