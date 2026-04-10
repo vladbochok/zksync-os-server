@@ -28,7 +28,7 @@ use zksync_os_zisk_lib::merkle::{
     self as zisk_merkle, BatchTreeUpdate, NeighborProofEntry, SlotProofEntry, StorageProof,
     TreeLeaf, WriteOp, TREE_DEPTH,
 };
-use zksync_os_zisk_lib::types::*;
+use zksync_os_zisk_lib::types::{self, *};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1062,80 +1062,55 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
 
     let caller = tx.signer();
 
-    let (gas_price, gas_priority_fee, value, data, chain_id, tx_type, mint, rr, is_l1, l1_hash, signed_bytes) =
+    // Helper to ABI-encode an L1/upgrade tx as L2CanonicalTransaction.
+    fn abi_encode_l1<T: zksync_os_types::L1TxType>(i: &zksync_os_types::L1Tx<T>, tx_type_byte: u8) -> Vec<u8> {
+        zksync_os_contract_interface::L2CanonicalTransaction {
+            txType: U256::from(tx_type_byte),
+            from: U256::from_be_slice(i.initiator.as_slice()),
+            to: U256::from_be_slice(i.to.as_slice()),
+            gasLimit: U256::from(i.gas_limit),
+            gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
+            maxFeePerGas: U256::from(i.max_fee_per_gas),
+            maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
+            paymaster: U256::ZERO,
+            nonce: U256::from(i.nonce),
+            value: U256::from(i.value),
+            reserved: [
+                U256::from(i.to_mint),
+                U256::from_be_slice(i.refund_recipient.as_slice()),
+                U256::ZERO, U256::ZERO,
+            ],
+            data: i.input().to_vec().into(),
+            signature: Default::default(),
+            factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
+            paymasterInput: Default::default(),
+            reservedDynamic: Default::default(),
+        }.abi_encode()
+    }
+
+    let (gas_price, gas_priority_fee, value, data, chain_id, tx_type, mint, rr, auth) =
         match tx.envelope() {
             ZkEnvelope::System(_) => return None,
             ZkEnvelope::L2(l2) => (
                 l2.max_fee_per_gas(), l2.max_priority_fee_per_gas(),
                 l2.value(), l2.input().to_vec(), l2.chain_id(),
-                l2.tx_type() as u8, None, None, false, None,
-                // L2 txs: EIP-2718 encoded signed bytes (for ecrecover + tx_hash)
-                Some(tx.envelope().encoded_2718()),
+                l2.tx_type() as u8, None, None,
+                TxAuth::L2 { signed_bytes: tx.envelope().encoded_2718() },
             ),
             ZkEnvelope::L1(l1) => {
                 let i = &l1.inner;
-                // Reconstruct L2CanonicalTransaction and ABI-encode it.
-                // This matches the original hash computation: keccak256(L2CanonicalTransaction.abi_encode()).
-                let canonical_tx = zksync_os_contract_interface::L2CanonicalTransaction {
-                    txType: U256::from(0x7fu8),
-                    from: U256::from_be_slice(i.initiator.as_slice()),
-                    to: U256::from_be_slice(i.to.as_slice()),
-                    gasLimit: U256::from(i.gas_limit),
-                    gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
-                    maxFeePerGas: U256::from(i.max_fee_per_gas),
-                    maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
-                    paymaster: U256::ZERO,
-                    nonce: U256::from(i.nonce),
-                    value: U256::from(i.value),
-                    reserved: [
-                        U256::from(i.to_mint),
-                        U256::from_be_slice(i.refund_recipient.as_slice()),
-                        U256::ZERO,
-                        U256::ZERO,
-                    ],
-                    data: i.input().to_vec().into(),
-                    signature: Default::default(),
-                    factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
-                    paymasterInput: Default::default(),
-                    reservedDynamic: Default::default(),
-                };
-                let abi_bytes = canonical_tx.abi_encode();
                 (l1.max_fee_per_gas(), l1.max_priority_fee_per_gas(),
                  i.value(), i.input().to_vec(), None, 0x7f,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient), true, Some(i.hash),
-                 Some(abi_bytes))
+                 Some(i.refund_recipient),
+                 TxAuth::L1 { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7f) })
             }
             ZkEnvelope::Upgrade(u) => {
                 let i = &u.inner;
-                let canonical_tx = zksync_os_contract_interface::L2CanonicalTransaction {
-                    txType: U256::from(0x7eu8),
-                    from: U256::from_be_slice(i.initiator.as_slice()),
-                    to: U256::from_be_slice(i.to.as_slice()),
-                    gasLimit: U256::from(i.gas_limit),
-                    gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
-                    maxFeePerGas: U256::from(i.max_fee_per_gas),
-                    maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
-                    paymaster: U256::ZERO,
-                    nonce: U256::from(i.nonce),
-                    value: U256::from(i.value),
-                    reserved: [
-                        U256::from(i.to_mint),
-                        U256::from_be_slice(i.refund_recipient.as_slice()),
-                        U256::ZERO,
-                        U256::ZERO,
-                    ],
-                    data: i.input().to_vec().into(),
-                    signature: Default::default(),
-                    factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
-                    paymasterInput: Default::default(),
-                    reservedDynamic: Default::default(),
-                };
-                let abi_bytes = canonical_tx.abi_encode();
                 (0, None, i.value(), i.input().to_vec(), None, 0x7e,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient), false, Some(i.hash),
-                 Some(abi_bytes))
+                 Some(i.refund_recipient),
+                 TxAuth::Upgrade { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7e) })
             }
         };
 
@@ -1146,10 +1121,7 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
         nonce: tx.nonce(), chain_id, tx_type,
         gas_used_override: None, force_fail: false,
         mint, refund_recipient: rr,
-        is_l1_tx: is_l1, l1_tx_hash: l1_hash,
-        // signed_tx_bytes: keccak256(these_bytes) == tx_hash for ALL tx types.
-        // L2: EIP-2718 encoded signed bytes. L1/Upgrade: ABI-encoded L2CanonicalTransaction.
-        signed_tx_bytes: signed_bytes,
+        auth,
     })
 }
 
@@ -1301,12 +1273,9 @@ fn run_pre_execution<DB: DatabaseRef>(
             .data(Bytes::copy_from_slice(&tx_input.data)).nonce(tx_input.nonce)
             .tx_type(Some(tx_input.tx_type)).chain_id(tx_input.chain_id).blob_hashes(vec![]);
         if let Some(fee) = tx_input.gas_priority_fee { b = b.gas_priority_fee(Some(fee)); }
-        let tx_hash = if let Some(hash) = tx_input.l1_tx_hash {
-            hash
-        } else if let Some(ref signed) = tx_input.signed_tx_bytes {
-            alloy::primitives::keccak256(signed)
-        } else {
-            B256::ZERO
+        let tx_hash = match &tx_input.auth {
+            TxAuth::L1 { tx_hash, .. } | TxAuth::Upgrade { tx_hash, .. } => *tx_hash,
+            TxAuth::L2 { signed_bytes } => alloy::primitives::keccak256(signed_bytes),
         };
         let tx: ZKsyncTx<revm::context::TxEnv> = ZKsyncTxBuilder::new()
             .base(b).mint(tx_input.mint.unwrap_or_default())
