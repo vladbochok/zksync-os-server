@@ -1249,10 +1249,18 @@ fn run_pre_execution<DB: DatabaseRef>(
             .data(Bytes::copy_from_slice(&tx_input.data)).nonce(tx_input.nonce)
             .tx_type(Some(tx_input.tx_type)).chain_id(tx_input.chain_id).blob_hashes(vec![]);
         if let Some(fee) = tx_input.gas_priority_fee { b = b.gas_priority_fee(Some(fee)); }
+        let tx_hash = if let Some(hash) = tx_input.l1_tx_hash {
+            hash
+        } else if let Some(ref signed) = tx_input.signed_tx_bytes {
+            alloy::primitives::keccak256(signed)
+        } else {
+            B256::ZERO
+        };
         let tx: ZKsyncTx<revm::context::TxEnv> = ZKsyncTxBuilder::new()
             .base(b).mint(tx_input.mint.unwrap_or_default())
             .refund_recipient(tx_input.refund_recipient)
             .gas_used_override(gas_override).force_fail(force_fail)
+            .tx_hash(tx_hash)
             .build().expect("tx build failed");
         match evm.transact_commit(tx) {
             Ok(result) => {
