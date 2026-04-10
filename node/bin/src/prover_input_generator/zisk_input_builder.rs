@@ -1080,9 +1080,10 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
                 let i = &u.inner;
                 // Upgrade txs are NOT L1 txs — they don't count toward number_of_layer1_txs
                 // and their hash is NOT included in priority_ops_rolling_hash.
+                // But they DO emit a bootloader result log using the upgrade tx hash.
                 (0, None, i.value(), i.input().to_vec(), None, 0x7e,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient), false, None)
+                 Some(i.refund_recipient), false, Some(i.hash))
             }
         };
 
