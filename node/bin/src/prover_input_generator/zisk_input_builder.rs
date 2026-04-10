@@ -1058,46 +1058,52 @@ fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -
 }
 
 fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
-    let caller = tx.signer();
-    let encoded_bytes = tx.envelope().encoded_2718();
+    use zksync_os_types::TransactionData;
 
-    let (gas_price, gas_priority_fee, value, data, chain_id, tx_type, mint, rr, is_l1, l1_hash) =
+    let caller = tx.signer();
+
+    let (gas_price, gas_priority_fee, value, data, chain_id, tx_type, mint, rr, is_l1, l1_hash, signed_bytes) =
         match tx.envelope() {
             ZkEnvelope::System(_) => return None,
             ZkEnvelope::L2(l2) => (
                 l2.max_fee_per_gas(), l2.max_priority_fee_per_gas(),
                 l2.value(), l2.input().to_vec(), l2.chain_id(),
                 l2.tx_type() as u8, None, None, false, None,
+                // L2 txs: EIP-2718 encoded signed bytes (for ecrecover + tx_hash)
+                Some(tx.envelope().encoded_2718()),
             ),
             ZkEnvelope::L1(l1) => {
                 let i = &l1.inner;
+                // L1 txs: ABI-encoded L2CanonicalTransaction (keccak256 = l1_tx_hash)
+                let abi_bytes = TransactionData::from(l1.clone()).abi_encode();
                 (l1.max_fee_per_gas(), l1.max_priority_fee_per_gas(),
                  i.value(), i.input().to_vec(), None, 0x7f,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient), true, Some(i.hash))
+                 Some(i.refund_recipient), true, Some(i.hash),
+                 Some(abi_bytes))
             }
             ZkEnvelope::Upgrade(u) => {
                 let i = &u.inner;
-                // Upgrade txs are NOT L1 txs — they don't count toward number_of_layer1_txs
-                // and their hash is NOT included in priority_ops_rolling_hash.
-                // But they DO emit a bootloader result log using the upgrade tx hash.
+                // Upgrade txs: ABI-encoded (keccak256 = upgrade_tx_hash)
+                let abi_bytes = TransactionData::from(u.clone()).abi_encode();
                 (0, None, i.value(), i.input().to_vec(), None, 0x7e,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient), false, Some(i.hash))
+                 Some(i.refund_recipient), false, Some(i.hash),
+                 Some(abi_bytes))
             }
         };
 
     Some(TxInput {
         caller, gas_limit: tx.gas_limit(), gas_price,
-        gas_priority_fee, // preserve None when absent (#8)
+        gas_priority_fee,
         to: tx.to(), value, data,
         nonce: tx.nonce(), chain_id, tx_type,
         gas_used_override: None, force_fail: false,
         mint, refund_recipient: rr,
         is_l1_tx: is_l1, l1_tx_hash: l1_hash,
-        // Upgrade txs (0x7e) don't use signed_tx_bytes for hash computation.
-        // Their tx hash comes from batch_meta.upgrade_tx_hash (L1 canonical hash).
-        signed_tx_bytes: if tx_type == 0x7e { None } else { Some(encoded_bytes) },
+        // signed_tx_bytes: keccak256(these_bytes) == tx_hash for ALL tx types.
+        // L2: EIP-2718 encoded signed bytes. L1/Upgrade: ABI-encoded L2CanonicalTransaction.
+        signed_tx_bytes: signed_bytes,
     })
 }
 
