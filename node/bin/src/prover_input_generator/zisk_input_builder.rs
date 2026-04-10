@@ -1058,7 +1058,7 @@ fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -
 }
 
 fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
-    use zksync_os_types::TransactionData;
+    use alloy::sol_types::SolValue;
 
     let caller = tx.signer();
 
@@ -1074,8 +1074,32 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
             ),
             ZkEnvelope::L1(l1) => {
                 let i = &l1.inner;
-                // L1 txs: ABI-encoded L2CanonicalTransaction (keccak256 = l1_tx_hash)
-                let abi_bytes = TransactionData::from(l1.clone()).abi_encode();
+                // Reconstruct L2CanonicalTransaction and ABI-encode it.
+                // This matches the original hash computation: keccak256(L2CanonicalTransaction.abi_encode()).
+                let canonical_tx = zksync_os_contract_interface::L2CanonicalTransaction {
+                    txType: U256::from(0x7fu8),
+                    from: U256::from_be_slice(i.initiator.as_slice()),
+                    to: U256::from_be_slice(i.to.as_slice()),
+                    gasLimit: U256::from(i.gas_limit),
+                    gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
+                    maxFeePerGas: U256::from(i.max_fee_per_gas),
+                    maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
+                    paymaster: U256::ZERO,
+                    nonce: U256::from(i.nonce),
+                    value: U256::from(i.value),
+                    reserved: [
+                        U256::from(i.to_mint),
+                        U256::from_be_slice(i.refund_recipient.as_slice()),
+                        U256::ZERO,
+                        U256::ZERO,
+                    ],
+                    data: i.input().to_vec().into(),
+                    signature: Default::default(),
+                    factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
+                    paymasterInput: Default::default(),
+                    reservedDynamic: Default::default(),
+                };
+                let abi_bytes = canonical_tx.abi_encode();
                 (l1.max_fee_per_gas(), l1.max_priority_fee_per_gas(),
                  i.value(), i.input().to_vec(), None, 0x7f,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
@@ -1084,8 +1108,30 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
             }
             ZkEnvelope::Upgrade(u) => {
                 let i = &u.inner;
-                // Upgrade txs: ABI-encoded (keccak256 = upgrade_tx_hash)
-                let abi_bytes = TransactionData::from(u.clone()).abi_encode();
+                let canonical_tx = zksync_os_contract_interface::L2CanonicalTransaction {
+                    txType: U256::from(0x7eu8),
+                    from: U256::from_be_slice(i.initiator.as_slice()),
+                    to: U256::from_be_slice(i.to.as_slice()),
+                    gasLimit: U256::from(i.gas_limit),
+                    gasPerPubdataByteLimit: U256::from(i.gas_per_pubdata_byte_limit),
+                    maxFeePerGas: U256::from(i.max_fee_per_gas),
+                    maxPriorityFeePerGas: U256::from(i.max_priority_fee_per_gas),
+                    paymaster: U256::ZERO,
+                    nonce: U256::from(i.nonce),
+                    value: U256::from(i.value),
+                    reserved: [
+                        U256::from(i.to_mint),
+                        U256::from_be_slice(i.refund_recipient.as_slice()),
+                        U256::ZERO,
+                        U256::ZERO,
+                    ],
+                    data: i.input().to_vec().into(),
+                    signature: Default::default(),
+                    factoryDeps: i.factory_deps.iter().map(|h| U256::from_be_bytes(h.0)).collect(),
+                    paymasterInput: Default::default(),
+                    reservedDynamic: Default::default(),
+                };
+                let abi_bytes = canonical_tx.abi_encode();
                 (0, None, i.value(), i.input().to_vec(), None, 0x7e,
                  Some(U256::from_limbs(i.to_mint.into_limbs())),
                  Some(i.refund_recipient), false, Some(i.hash),
