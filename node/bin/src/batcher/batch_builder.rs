@@ -79,6 +79,28 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
     let proving_version =
         ProvingVersion::try_from(blocks.first().unwrap().1.protocol_version.clone())?;
     // execution version should be the same for all the blocks, it is ensured by the seal criteria
+    // Extract after-state account preimages for 0x8003 verification.
+    let account_preimages_after = {
+        use zksync_os_interface::traits::{PreimageSource, ReadStorage};
+        let last_block_number = blocks.last().unwrap().1.block_context.block_number;
+        let mut state_after = read_state.state_view_at(last_block_number)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut preimages = Vec::new();
+        for (block_output, _, _, _) in blocks {
+            for diff in &block_output.account_diffs {
+                if !seen.insert(diff.address) { continue; }
+                let addr_bytes: [u8; 20] = diff.address.into();
+                let flat_key = zksync_os_zisk_lib::merkle::derive_account_properties_key(&addr_bytes);
+                if let Some(hash_value) = ReadStorage::read(&mut state_after, alloy::primitives::B256::from(flat_key.0)) {
+                    if let Some(preimage) = state_after.get_preimage(hash_value) {
+                        preimages.push((diff.address, preimage));
+                    }
+                }
+            }
+        }
+        preimages
+    };
+
     let batch_prover_input = compute_batch_prover_input(
         blocks,
         proving_version,
@@ -88,6 +110,7 @@ pub(crate) fn seal_batch<ReadState: ReadStateHistory>(
         &batch_info,
         batch_tree_start,
         batch_tree_end,
+        account_preimages_after,
     )?;
 
     // Sanity check: all blocks in the batch should have the same protocol version
@@ -145,6 +168,7 @@ fn compute_batch_prover_input(
     batch_info: &BatchInfo,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    account_preimages_after: Vec<(Address, Vec<u8>)>,
 ) -> anyhow::Result<ProverInput> {
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_dev::run::generate_batch_proof_input as generate_batch_proof_input_dev;
@@ -187,7 +211,7 @@ fn compute_batch_prover_input(
     // If any block carries ZiSK data, assemble the batch-level ZiSK BatchInput
     let has_zisk = blocks.iter().any(|(_, _, _, pi)| pi.zisk_data().is_some());
     let zisk_data = if has_zisk {
-        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info, batch_tree_start, batch_tree_end)?)
+        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info, batch_tree_start, batch_tree_end, account_preimages_after)?)
     } else {
         None
     };
@@ -209,6 +233,7 @@ fn assemble_zisk_batch(
     batch_info: &BatchInfo,
     batch_tree_start: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
     batch_tree_end: Option<zksync_os_merkle_tree::MerkleTreeVersion>,
+    account_preimages_after: Vec<(Address, Vec<u8>)>,
 ) -> anyhow::Result<Vec<u8>> {
     use blake2::{Blake2s256, Digest};
     use crate::prover_input_generator::zisk_input_builder::ZiskBlockData;
@@ -307,6 +332,7 @@ fn assemble_zisk_batch(
                 })
                 .unwrap_or_default(),
             tree_update: build_batch_tree_update(blocks, batch_tree_start, batch_tree_end)?,
+            account_preimages_after: account_preimages_after,
         },
         blocks: block_data_vec
             .iter()
