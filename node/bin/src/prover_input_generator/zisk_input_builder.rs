@@ -373,16 +373,19 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         previous_block_timestamp: replay_record.previous_block_timestamp,
         tree_update,
         bytecodes: {
-            // Merge keccak-keyed bytecodes with blake2s-keyed force-deploy bytecodes
-            // into a single list. The deployer precompile looks up by blake2s hash,
-            // while regular contracts use keccak256. Both go into the same bytecodes map.
+            // All bytecodes keyed by keccak256. Force-deploy preimages are stored
+            // in the preimage DB by blake2s — re-key them by keccak256 here.
             let mut all = bytecodes_out;
-            for entry in block_output.published_preimages.iter()
+            let mut seen: std::collections::HashSet<B256> =
+                all.iter().map(|(h, _)| *h).collect();
+            for (_blake2s_hash, code) in block_output.published_preimages.iter()
                 .chain(&replay_record.force_preimages)
-                .map(|(h, c)| (*h, c.clone()))
-                .chain(bytecodes_extra.into_iter())
+                .chain(bytecodes_extra.iter())
             {
-                all.push(entry);
+                let keccak_hash = alloy::primitives::keccak256(code);
+                if seen.insert(keccak_hash) {
+                    all.push((keccak_hash, code.clone()));
+                }
             }
             all
         },

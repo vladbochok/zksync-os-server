@@ -7,6 +7,8 @@ use reth_revm::{
     state::{AccountInfo, Bytecode},
 };
 use ruint::aliases::B160;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use zk_ee::common_structs::derive_flat_storage_key;
 use zksync_os_interface::types::BlockHashes;
 use zksync_os_merkle_tree::fixed_bytes_to_bytes32;
@@ -20,6 +22,10 @@ where
     state_view: State,
     block_hashes: BlockHashes,
     state_block_number: u64,
+    /// Bytecodes keyed by keccak256(raw_code), populated during basic_ref.
+    /// The deployer precompile looks up by keccak256 (observable hash),
+    /// but the preimage DB stores by blake2s. This cache bridges the gap.
+    keccak_code_cache: RefCell<HashMap<B256, Bytecode>>,
 }
 
 impl<State> RevmStateProvider<State>
@@ -31,6 +37,7 @@ where
             state_view,
             block_hashes,
             state_block_number,
+            keccak_code_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -66,9 +73,18 @@ where
                 let code = if props.bytecode_hash.is_zero() {
                     None
                 } else {
+                    // Load from preimage DB by blake2s hash, unpad to raw code.
                     let bytecode =
                         self.code_by_hash_ref(B256::from(props.bytecode_hash.as_u8_array()))?;
-                    Some(get_unpadded_code(bytecode.bytes_slice(), &props))
+                    let raw = get_unpadded_code(bytecode.bytes_slice(), &props);
+                    // Cache by keccak256 so the deployer precompile can look it up.
+                    if !observable_code_hash.is_zero() && observable_code_hash != KECCAK256_EMPTY {
+                        self.keccak_code_cache.borrow_mut().insert(
+                            observable_code_hash,
+                            Bytecode::new_raw(raw.original_bytes().clone()),
+                        );
+                    }
+                    Some(raw)
                 };
 
                 let code_len = code.as_ref().map(|c| c.len()).unwrap_or(0);
@@ -85,7 +101,12 @@ where
     }
 
     /// Gets account code by its hash.
+    /// Checks keccak256 cache first (for deployer precompile lookups),
+    /// then falls back to preimage DB (blake2s keying).
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if let Some(cached) = self.keccak_code_cache.borrow().get(&code_hash) {
+            return Ok(cached.clone());
+        }
         Ok(self
             .state_view
             .clone()
