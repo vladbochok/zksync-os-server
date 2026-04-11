@@ -373,16 +373,23 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         previous_block_timestamp: replay_record.previous_block_timestamp,
         tree_update,
         bytecodes: {
-            // Merge keccak-keyed bytecodes with blake2s-keyed force-deploy bytecodes
-            // into a single list. The deployer precompile looks up by blake2s hash,
-            // while regular contracts use keccak256. Both go into the same bytecodes map.
+            // All bytecodes are keyed by keccak256(raw_code). Force-deployed preimages
+            // are stored as (blake2s_hash, padded_code) — convert to (keccak256, raw_code).
+            // The padded code may include jump bitmap; we strip trailing zeros to get raw code,
+            // then re-key by keccak256.
             let mut all = bytecodes_out;
-            for entry in block_output.published_preimages.iter()
+            let mut seen = all.iter().map(|(h, _)| *h).collect::<std::collections::HashSet<_>>();
+            for (_, padded_code) in block_output.published_preimages.iter()
                 .chain(&replay_record.force_preimages)
-                .map(|(h, c)| (*h, c.clone()))
-                .chain(bytecodes_extra.into_iter())
+                .chain(bytecodes_extra.iter())
             {
-                all.push(entry);
+                // The raw code is the padded code — the deployer precompile uses
+                // bytecode_length from calldata to truncate, so we provide the full padded code
+                // and key it by keccak256.
+                let keccak_hash = alloy::primitives::keccak256(padded_code);
+                if seen.insert(keccak_hash) {
+                    all.push((keccak_hash, padded_code.clone()));
+                }
             }
             all
         },
