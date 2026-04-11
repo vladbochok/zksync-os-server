@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 /// Default maximum number of cached entries.
 const DEFAULT_MAX_ENTRIES: usize = 100;
 /// Default maximum age for cached entries.
-const DEFAULT_MAX_AGE: Duration = Duration::from_secs(3600); // 1 hour
+const DEFAULT_MAX_AGE: Duration = Duration::from_secs(86400); // 24 hours
 
 struct CacheEntry {
     data: Vec<u8>,
