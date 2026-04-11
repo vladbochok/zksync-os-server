@@ -81,7 +81,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
 
     // For upgrade blocks, include all known system/user contract addresses.
     // The genesis upgrade accesses many addresses that aren't in storage_writes/account_diffs.
-    if transactions.iter().any(|tx| tx.tx_type == 0x7e) {
+    if transactions.iter().any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. })) {
         for i in 0..=0x0c {
             let addr: Address = format!("0x{:040x}", 0x10000u64 + i).parse().unwrap();
             if !initial_addrs.contains(&addr) {
@@ -107,7 +107,7 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         load_accounts_and_bytecodes(&initial_addrs, &mut state_with_preimages, block_output, replay_record);
 
     // For upgrade txs: pre-create accounts that are force-deployed in this block.
-    let has_upgrade = transactions.iter().any(|tx| tx.tx_type == 0x7e);
+    let has_upgrade = transactions.iter().any(|tx| matches!(tx.auth, TxAuth::Upgrade { .. }));
     let mut bytecodes_extra = Vec::new();
     if has_upgrade {
         pre_create_upgrade_accounts(
@@ -123,11 +123,16 @@ pub fn build_block_data<ReadState: ReadStateHistory>(
         let mut scanned = HashSet::new();
         let mut calldata_resolved = 0;
         for tx in &transactions {
-            if tx.tx_type != 0x7e { continue; }
-            // The outer calldata: upgrade(address, bytes)
-            // Skip selector(4) + address(32) + offset(32) + length(32) = 100 bytes
-            // The inner calldata starts at byte 100
-            let data = &tx.data;
+            let abi_data = match &tx.auth {
+                TxAuth::Upgrade { abi_encoded, .. } => abi_encoded,
+                _ => continue,
+            };
+            // Extract calldata from the ABI-encoded L2CanonicalTransaction.
+            // Field 14 is the data offset (relative to outer offset 32).
+            let data_rel_offset: usize = alloy::primitives::U256::from_be_slice(&abi_data[32 + 14*32..32 + 15*32]).to();
+            let data_abs_offset = 32 + data_rel_offset;
+            let data_len: usize = alloy::primitives::U256::from_be_slice(&abi_data[data_abs_offset..data_abs_offset + 32]).to();
+            let data = &abi_data[data_abs_offset + 32..data_abs_offset + 32 + data_len];
             // Scan at every byte offset, not just 32-byte aligned,
             // because nested ABI encoding places hashes at arbitrary offsets.
             for offset in 0..data.len() {
@@ -1048,8 +1053,6 @@ fn convert_all_txs(transactions: &[ZkTransaction], block_output: &BlockOutput) -
 fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
     use alloy::sol_types::SolValue;
 
-    let caller = tx.signer();
-
     // Helper to ABI-encode an L1/upgrade tx as L2CanonicalTransaction.
     fn abi_encode_l1<T: zksync_os_types::L1TxType>(i: &zksync_os_types::L1Tx<T>, tx_type_byte: u8) -> Vec<u8> {
         zksync_os_contract_interface::L2CanonicalTransaction {
@@ -1076,39 +1079,25 @@ fn convert_tx(tx: &ZkTransaction) -> Option<TxInput> {
         }.abi_encode()
     }
 
-    let (gas_price, gas_priority_fee, value, data, chain_id, tx_type, mint, rr, auth) =
-        match tx.envelope() {
-            ZkEnvelope::System(_) => return None,
-            ZkEnvelope::L2(l2) => (
-                l2.max_fee_per_gas(), l2.max_priority_fee_per_gas(),
-                l2.value(), l2.input().to_vec(), l2.chain_id(),
-                l2.tx_type() as u8, None, None,
-                TxAuth::L2 { signed_bytes: tx.envelope().encoded_2718() },
-            ),
-            ZkEnvelope::L1(l1) => {
-                let i = &l1.inner;
-                (l1.max_fee_per_gas(), l1.max_priority_fee_per_gas(),
-                 i.value(), i.input().to_vec(), None, 0x7f,
-                 Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient),
-                 TxAuth::L1 { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7f) })
-            }
-            ZkEnvelope::Upgrade(u) => {
-                let i = &u.inner;
-                (0, None, i.value(), i.input().to_vec(), None, 0x7e,
-                 Some(U256::from_limbs(i.to_mint.into_limbs())),
-                 Some(i.refund_recipient),
-                 TxAuth::Upgrade { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7e) })
-            }
-        };
+    let auth = match tx.envelope() {
+        ZkEnvelope::System(_) => return None,
+        ZkEnvelope::L2(_) => {
+            TxAuth::L2 { signed_bytes: tx.envelope().encoded_2718() }
+        }
+        ZkEnvelope::L1(l1) => {
+            let i = &l1.inner;
+            TxAuth::L1 { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7f) }
+        }
+        ZkEnvelope::Upgrade(u) => {
+            let i = &u.inner;
+            TxAuth::Upgrade { tx_hash: i.hash, abi_encoded: abi_encode_l1(i, 0x7e) }
+        }
+    };
 
     Some(TxInput {
-        caller, gas_limit: tx.gas_limit(), gas_price,
-        gas_priority_fee,
-        to: tx.to(), value, data,
-        nonce: tx.nonce(), chain_id, tx_type,
-        gas_used_override: None, force_fail: false,
-        mint, refund_recipient: rr,
+        chain_id: tx.envelope().chain_id(),
+        gas_used_override: None,
+        force_fail: false,
         auth,
     })
 }
@@ -1254,26 +1243,51 @@ fn run_pre_execution<DB: DatabaseRef>(
             Some(Err(_)) => (Some(0), true),
             None => (None, false),
         };
-        let kind = match tx_input.to { Some(a) => TxKind::Call(a), None => TxKind::Create };
-        let mut b = revm::context::TxEnv::builder()
-            .caller(tx_input.caller).gas_limit(tx_input.gas_limit)
-            .gas_price(tx_input.gas_price).kind(kind).value(tx_input.value)
-            .data(Bytes::copy_from_slice(&tx_input.data)).nonce(tx_input.nonce)
-            .tx_type(Some(tx_input.tx_type)).chain_id(tx_input.chain_id).blob_hashes(vec![]);
-        if let Some(fee) = tx_input.gas_priority_fee { b = b.gas_priority_fee(Some(fee)); }
-        let tx_hash = match &tx_input.auth {
-            TxAuth::L1 { tx_hash, .. } | TxAuth::Upgrade { tx_hash, .. } => *tx_hash,
-            TxAuth::L2 { signed_bytes } => alloy::primitives::keccak256(signed_bytes),
+        // Decode tx fields from the authenticated source, matching the guest's logic.
+        let (caller, kind, value, data, nonce, gas_limit, gas_price, gas_priority_fee,
+             chain_id, tx_type, mint, refund_recipient, tx_hash) = match &tx_input.auth {
+            TxAuth::L1 { tx_hash, abi_encoded } | TxAuth::Upgrade { tx_hash, abi_encoded } => {
+                let w = |f: usize| alloy::primitives::U256::from_be_slice(&abi_encoded[32 + f*32..32 + (f+1)*32]);
+                let a = |f: usize| Address::from_slice(&w(f).to_be_bytes::<32>()[12..]);
+                let raw_gl: u64 = w(3).to();
+                let tt: u8 = w(0).to();
+                let gl = if tt == 0x7e { raw_gl.saturating_mul(10) } else { raw_gl };
+                let data_rel: usize = w(14).to();
+                let data_abs = 32 + data_rel;
+                let data_len: usize = alloy::primitives::U256::from_be_slice(&abi_encoded[data_abs..data_abs+32]).to();
+                let data = abi_encoded[data_abs+32..data_abs+32+data_len].to_vec();
+                let rr = a(11);
+                (a(1), TxKind::Call(a(2)), w(9), data, w(8).to::<u64>(), gl, w(5).to::<u128>(),
+                 None, tx_input.chain_id, tt, w(10),
+                 if rr.is_zero() { None } else { Some(rr) }, *tx_hash)
+            }
+            TxAuth::L2 { signed_bytes } => {
+                use alloy::consensus::Transaction;
+                use alloy::consensus::TxEnvelope;
+                use alloy::eips::Decodable2718;
+                let env = TxEnvelope::decode_2718(&mut &signed_bytes[..]).expect("decode");
+                let signer = alloy::consensus::transaction::SignerRecoverable::recover_signer(&env).expect("ecrecover");
+                let k = match env.to() { Some(a) => TxKind::Call(a), None => TxKind::Create };
+                let h = alloy::primitives::keccak256(signed_bytes);
+                (signer, k, env.value(), env.input().to_vec(), env.nonce(), env.gas_limit(),
+                 env.max_fee_per_gas(), env.max_priority_fee_per_gas(),
+                 env.chain_id().or(tx_input.chain_id), env.tx_type() as u8,
+                 U256::ZERO, None, h)
+            }
         };
+        let mut b = revm::context::TxEnv::builder()
+            .caller(caller).gas_limit(gas_limit).gas_price(gas_price)
+            .kind(kind).value(value).data(Bytes::from(data)).nonce(nonce)
+            .tx_type(Some(tx_type)).chain_id(chain_id).blob_hashes(vec![]);
+        if let Some(fee) = gas_priority_fee { b = b.gas_priority_fee(Some(fee)); }
         let tx: ZKsyncTx<revm::context::TxEnv> = ZKsyncTxBuilder::new()
-            .base(b).mint(tx_input.mint.unwrap_or_default())
-            .refund_recipient(tx_input.refund_recipient)
+            .base(b).mint(mint).refund_recipient(refund_recipient)
             .gas_used_override(gas_override).force_fail(force_fail)
             .tx_hash(tx_hash)
             .build().expect("tx build failed");
         match evm.transact_commit(tx) {
             Ok(result) => {
-                if tx_input.tx_type == 0x7e {
+                if matches!(tx_input.auth, TxAuth::Upgrade { .. }) {
                     tracing::info!(
                         success = result.is_success(),
                         gas_used = result.gas_used(),
@@ -1282,7 +1296,7 @@ fn run_pre_execution<DB: DatabaseRef>(
                 }
             }
             Err(e) => {
-                if tx_input.tx_type == 0x7e {
+                if matches!(tx_input.auth, TxAuth::Upgrade { .. }) {
                     tracing::warn!("pre-execution upgrade tx error: {e:?}");
                 }
             }
