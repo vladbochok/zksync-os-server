@@ -237,10 +237,16 @@ impl<P: AnyZksProtocolVersion, Replay: ReadReplay + Clone> ConnectionHandler
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_CHANNEL_CAPACITY);
         let conn = into_message_stream::<P>(conn);
 
-        let task = if self.node_role.is_main() {
+        // Main node always serves. An EN asks upstream on connections it
+        // initiated (outgoing) and serves any peer that dials into it
+        // (incoming). The latter lets a caught-up EN act as a replay source
+        // for other ENs that can't reach the main node directly — as long
+        // as its local replay storage has the records the peer asks for.
+        let serve_side = self.node_role.is_main() || matches!(direction, Direction::Incoming);
+        let task = if serve_side {
             tokio::spawn(
                 run_mn_connection::<P, _>(conn, outbound_tx, self.replay)
-                    .instrument(tracing::info_span!("mn_connection", %peer_id)),
+                    .instrument(tracing::info_span!("mn_connection", %peer_id, ?direction)),
             )
         } else {
             tokio::spawn(
@@ -251,7 +257,7 @@ impl<P: AnyZksProtocolVersion, Replay: ReadReplay + Clone> ConnectionHandler
                     self.record_overrides,
                     self.replay_sender,
                 )
-                .instrument(tracing::info_span!("en_connection", %peer_id)),
+                .instrument(tracing::info_span!("en_connection", %peer_id, ?direction)),
             )
         };
 
