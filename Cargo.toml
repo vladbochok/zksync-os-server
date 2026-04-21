@@ -25,6 +25,7 @@ members = [
     "tools/generate-deposit",
     "tools/verify-storage-proof",
     "tools/zisk-batch-test",
+    "tools/zisk-en-feeder",
     "lib/observability",
     "lib/state_full_diffs",
     "lib/status",

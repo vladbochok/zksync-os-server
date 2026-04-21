@@ -173,10 +173,27 @@ fn compute_batch_prover_input(
     use zk_os_forward_system::run::generate_batch_proof_input;
     use zk_os_forward_system_dev::run::generate_batch_proof_input as generate_batch_proof_input_dev;
 
+    // DEBUG: log every batch sealed, with fake-block count
+    let first_block = blocks.first().map(|(_, rr, _, _)| rr.block_context.block_number).unwrap_or(0);
+    let last_block = blocks.last().map(|(_, rr, _, _)| rr.block_context.block_number).unwrap_or(0);
+    let fake_count = blocks.iter().filter(|(_, _, _, pi)| pi.is_fake()).count();
+    let has_zisk_count = blocks.iter().filter(|(_, _, _, pi)| pi.zisk_data().is_some()).count();
+    tracing::error!(
+        target: "DUMP_DEBUG",
+        first_block, last_block, block_count = blocks.len(),
+        fake_count, has_zisk_count, ?proving_version,
+        "compute_batch_prover_input called"
+    );
+
     if blocks
         .iter()
         .any(|(_, _, _, pi)| pi.is_fake())
     {
+        tracing::error!(
+            target: "DUMP_DEBUG",
+            first_block, last_block, fake_count,
+            "batch contains Fake blocks — returning ProverInput::Fake, no dump"
+        );
         return Ok(ProverInput::Fake);
     }
 
@@ -210,8 +227,31 @@ fn compute_batch_prover_input(
 
     // If any block carries ZiSK data, assemble the batch-level ZiSK BatchInput
     let has_zisk = blocks.iter().any(|(_, _, _, pi)| pi.zisk_data().is_some());
+    tracing::error!(
+        target: "DUMP_DEBUG",
+        first_block, last_block,
+        has_zisk,
+        "ready to assemble ZiSK batch? {}", has_zisk
+    );
     let zisk_data = if has_zisk {
-        Some(assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info, batch_tree_start, batch_tree_end, account_preimages_after)?)
+        match assemble_zisk_batch(blocks, pubdata_mode, multichain_root, sl_chain_id, batch_info, batch_tree_start, batch_tree_end, account_preimages_after) {
+            Ok(v) => {
+                tracing::error!(
+                    target: "DUMP_DEBUG",
+                    first_block, last_block, zisk_bytes = v.len(),
+                    "assemble_zisk_batch OK"
+                );
+                Some(v)
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "DUMP_DEBUG",
+                    first_block, last_block, err = %e,
+                    "assemble_zisk_batch FAILED"
+                );
+                return Err(e);
+            }
+        }
     } else {
         None
     };
@@ -357,6 +397,13 @@ fn assemble_zisk_batch(
     };
 
     let serialized = bincode1::serialize(&batch_input).expect("failed to serialize ZiSK BatchInput");
+    tracing::error!(
+        target: "DUMP_DEBUG",
+        batch_num = batch_info.batch_number,
+        bincode_len = serialized.len(),
+        dump_dir_env = std::env::var("ZISK_DUMP_DIR").unwrap_or_else(|_| "(unset)".into()),
+        "assemble_zisk_batch: reached dump check"
+    );
 
     // If ZISK_DUMP_DIR is set, write the BatchInput to disk for external proving.
     if let Ok(dump_dir) = std::env::var("ZISK_DUMP_DIR") {

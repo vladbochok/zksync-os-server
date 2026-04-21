@@ -14973,6 +14973,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "zksync_os_zisk_en_feeder"
+version = "0.18.1"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "bincode 2.0.1",
+ "clap",
+ "hex",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+ "zksync-os-zisk-lib",
+ "zksync_os_interface",
+ "zksync_os_merkle_tree",
+ "zksync_os_server",
+ "zksync_os_storage_api",
+ "zksync_os_types",
+]
+
+[[package]]
 name = "zstd"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

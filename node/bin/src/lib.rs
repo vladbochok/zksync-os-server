@@ -385,7 +385,7 @@ pub async fn run<State: ReadStateHistory + WriteState + StateInitializer + Clone
         config.general_config.force_starting_block_number,
         ?node_startup_state,
         starting_block,
-        blocks_to_replay = node_startup_state.block_replay_storage_last_block + 1 - starting_block,
+        blocks_to_replay = (node_startup_state.block_replay_storage_last_block + 1).saturating_sub(starting_block),
         "Node state on startup"
     );
 
@@ -1171,7 +1171,7 @@ async fn run_en_pipeline(
     let (applied_block_number_sender, applied_block_number_receiver) =
         watch::channel(starting_block - 1);
 
-    Pipeline::new(runtime.clone())
+    let pipeline = Pipeline::new(runtime.clone())
         .pipe(ExternalNodeCommandSource {
             replays_for_sequencer,
             up_to_block: config.sequencer_config.en_sync_up_to_block,
@@ -1204,21 +1204,76 @@ async fn run_en_pipeline(
                     )
                 }),
         )
-        .pipe(TreeManager { tree: tree.clone() })
-        .pipe_if(
-            config.batch_verification_config.client_enabled,
-            BatchVerificationClient::new(
+        .pipe(TreeManager { tree: tree.clone() });
+
+    if config.batcher_config.en_dump_only {
+        // EN dump-only mode: run ProverInputGenerator + Batcher, drain into
+        // NoOpSink. No FRI proving, no L1 settlement. `ZISK_DUMP_DIR` inside
+        // the Batcher writes bincode BatchInput to disk for offline testing.
+        // Dawn commits pubdata to L1 via blobs. For any other L1-settled
+        // chain, override via the `l1_sender_pubdata_mode` env var. The batch
+        // commitment hashes over the DA mode, so this must match the chain.
+        let pubdata_mode = config
+            .l1_sender_config
+            .pubdata_mode
+            .unwrap_or(PubdataMode::Blobs);
+        let (sidecar_tx, mut sidecar_rx) =
+            tokio::sync::mpsc::channel::<BlobTransactionSidecar>(8);
+        runtime.spawn_critical_task("en_dump_sidecar_drain", async move {
+            while sidecar_rx.recv().await.is_some() {
+                // In dump-only mode we never submit blob txs to L1, so drop
+                // whatever the Batcher produces to keep the channel unblocked.
+            }
+        });
+        pipeline
+            .pipe(ProverInputGenerator {
+                enable_logging: config.prover_input_generator_config.logging_enabled,
+                maximum_in_flight_blocks: config
+                    .prover_input_generator_config
+                    .maximum_in_flight_blocks,
+                read_state: state.clone(),
+                pubdata_mode,
+                runtime: runtime.clone(),
+                disabled: !config.prover_input_generator_config.enable_input_generation,
+                enable_second_proof_system: config
+                    .prover_input_generator_config
+                    .second_proof_system,
+            })
+            .pipe(Batcher {
+                startup_config: BatcherStartupConfig {
+                    last_committed_batch: node_state_on_startup.l1_state.last_committed_batch,
+                    last_executed_batch: node_state_on_startup.l1_state.last_executed_batch,
+                    last_persisted_block: node_state_on_startup.block_replay_storage_last_block,
+                },
                 chain_id,
-                node_state_on_startup.l1_state.diamond_proxy_address_sl(),
-                config.batch_verification_config.connect_address.clone(),
-                config.batch_verification_config.signing_key.clone(),
-                finality.clone(),
-                node_state_on_startup.l1_state.clone(),
-                state.clone(),
-            ),
-            NoOpSink::new(),
-        )
-        .spawn();
+                sl_chain_id: node_state_on_startup.l1_state.sl_chain_id,
+                chain_address_sl: node_state_on_startup.l1_state.diamond_proxy_address_sl(),
+                pubdata_limit_bytes: config.sequencer_config.block_pubdata_limit_bytes,
+                batcher_config: config.batcher_config.clone(),
+                pubdata_mode,
+                sidecar_sender: sidecar_tx,
+                committed_batch_provider: committed_batch_provider.clone(),
+                read_state: state.clone(),
+            })
+            .pipe(NoOpSink::new())
+            .spawn();
+    } else {
+        pipeline
+            .pipe_if(
+                config.batch_verification_config.client_enabled,
+                BatchVerificationClient::new(
+                    chain_id,
+                    node_state_on_startup.l1_state.diamond_proxy_address_sl(),
+                    config.batch_verification_config.connect_address.clone(),
+                    config.batch_verification_config.signing_key.clone(),
+                    finality.clone(),
+                    node_state_on_startup.l1_state.clone(),
+                    state.clone(),
+                ),
+                NoOpSink::new(),
+            )
+            .spawn();
+    }
 
     // Run Priority Tree tasks for EN - not part of the pipeline.
     if config.general_config.run_priority_tree {

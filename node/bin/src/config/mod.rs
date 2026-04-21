@@ -856,6 +856,14 @@ pub struct BatcherConfig {
     /// when recovering from corrupted state.
     #[config(default_t = true)]
     pub assert_rebuilt_batch_hashes: bool,
+
+    /// When true, run ProverInputGenerator + Batcher on an External Node and
+    /// discard the output (no FRI proving, no L1 settlement). Used together
+    /// with `ZISK_DUMP_DIR` to snapshot a production chain's `BatchInput`
+    /// bincode for offline execution through `zksync-os-zisk-lib`.
+    /// Has no effect on the Main Node.
+    #[config(default_t = false)]
+    pub en_dump_only: bool,
 }
 
 /// Only used on the Main Node.

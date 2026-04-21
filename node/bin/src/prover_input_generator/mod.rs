@@ -226,7 +226,16 @@ fn compute_prover_input(
         | ProvingVersion::V3
         | ProvingVersion::V4
         | ProvingVersion::V5 => {
-            panic!("computing prover input for batch with prover version v1-v5 is not supported");
+            // EN-dump-mode patch: instead of panicking, emit a Fake input so
+            // the pipeline can walk past historical blocks on pre-V6 protocol
+            // versions and reach the V6+ era where ZiSK proofs are supported.
+            tracing::warn!(
+                block_number,
+                ?proving_version,
+                "skipping prover input generation for pre-V6 block (returning ProverInput::Fake)"
+            );
+            drop(prover_input_generation_latency);
+            return ProverInput::Fake;
         }
         ProvingVersion::V6 | ProvingVersion::ZiskV1 => {
             use zk_ee::{

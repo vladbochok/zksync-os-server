@@ -129,49 +129,71 @@ impl<ReadState: ReadStateHistory + Clone + Send + 'static> PipelineComponent
             };
             latency_tracker.enter_state(GenericComponentState::Processing);
 
-            let recreated;
-            let batch_envelope =
-                if prev_batch_info.batch_number < self.startup_config.last_committed_batch {
-                    let committed_batch = self
-                        .committed_batch_provider
-                        .get(prev_batch_info.batch_number + 1)
-                        .with_context(|| {
-                            format!(
-                                "committed batch {} must have been discovered on L1",
-                                prev_batch_info.batch_number + 1
-                            )
-                        })?;
-                    // Validate that the existing batch's first block matches the next block in the stream
-                    anyhow::ensure!(
-                        committed_batch.first_block_number() == next_block_number,
-                        "Existing batch first block ({}) does not match next block in stream ({})",
-                        committed_batch.first_block_number(),
-                        next_block_number
-                    );
-
-                    let Some(batch_envelope) = self
-                        .recreate_existing_batch(
-                            &mut input,
-                            &latency_tracker,
-                            &prev_batch_info,
-                            committed_batch,
-                        )
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = true;
-                    batch_envelope
+            // en_dump_only mode: never freely create batches; only recreate
+            // ones the main node has already committed to L1. If the next
+            // expected batch hasn't landed on L1 yet, poll the provider
+            // until it does.
+            let next_batch_number = prev_batch_info.batch_number + 1;
+            let committed_batch_opt =
+                if self.batcher_config.en_dump_only {
+                    let mut poll = tokio::time::interval(std::time::Duration::from_secs(10));
+                    loop {
+                        if let Some(cb) = self.committed_batch_provider.get(next_batch_number) {
+                            break Some(cb);
+                        }
+                        tracing::debug!(
+                            next_batch_number,
+                            "en_dump_only: waiting for L1 commit before rebuilding batch"
+                        );
+                        poll.tick().await;
+                    }
+                } else if prev_batch_info.batch_number < self.startup_config.last_committed_batch {
+                    Some(
+                        self.committed_batch_provider
+                            .get(next_batch_number)
+                            .with_context(|| {
+                                format!(
+                                    "committed batch {next_batch_number} must have been discovered on L1"
+                                )
+                            })?,
+                    )
                 } else {
-                    let Some(batch_envelope) = self
-                        .create_batch(&mut input, &latency_tracker, &prev_batch_info)
-                        .await?
-                    else {
-                        return Ok(());
-                    };
-                    recreated = false;
-                    batch_envelope
+                    None
                 };
+
+            let recreated;
+            let batch_envelope = if let Some(committed_batch) = committed_batch_opt {
+                // Validate that the existing batch's first block matches the next block in the stream
+                anyhow::ensure!(
+                    committed_batch.first_block_number() == next_block_number,
+                    "Existing batch first block ({}) does not match next block in stream ({})",
+                    committed_batch.first_block_number(),
+                    next_block_number
+                );
+
+                let Some(batch_envelope) = self
+                    .recreate_existing_batch(
+                        &mut input,
+                        &latency_tracker,
+                        &prev_batch_info,
+                        committed_batch,
+                    )
+                    .await?
+                else {
+                    return Ok(());
+                };
+                recreated = true;
+                batch_envelope
+            } else {
+                let Some(batch_envelope) = self
+                    .create_batch(&mut input, &latency_tracker, &prev_batch_info)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                recreated = false;
+                batch_envelope
+            };
 
             let time_since_last_batch =
                 last_created_batch_at.map(|last_created_batch_at| last_created_batch_at.elapsed());
